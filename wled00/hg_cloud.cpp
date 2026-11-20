@@ -34,7 +34,7 @@
 #define HG_CLOUD_MAXCMD 2048
 #define HG_STATE_EVERY  60000UL
 
-static String hgHost, hgUser, hgPass, hgCa, hgCmdTopic, hgStateTopic;
+static String hgHost, hgUser, hgPass, hgCa, hgCert, hgKey, hgCmdTopic, hgStateTopic;
 static uint16_t hgPort = 8883;
 static bool hgLoaded = false, hgEnabled = false, hgStarted = false;
 static volatile bool hgConnected = false;
@@ -56,7 +56,7 @@ static void hgLoad() {
   hgLoaded = true;
   File f = WLED_FS.open(HG_CLOUD_FILE, "r");
   if (!f) return;
-  DynamicJsonDocument doc(2560);           // the certificate is ~600 bytes
+  DynamicJsonDocument doc(6144);           // server certificate plus, for AWS, our own certificate and key
   DeserializationError e = deserializeJson(doc, f);
   f.close();
   if (e) return;
@@ -65,12 +65,16 @@ static void hgLoad() {
   hgUser = doc["user"] | "";
   hgPass = doc["pass"] | "";
   hgCa   = doc["ca"]   | "";
+  hgCert = doc["cert"] | "";               // optional: this controller's own certificate and key
+  hgKey  = doc["key"]  | "";               // (AWS IoT style login instead of a password)
   int s = uri.indexOf("://");
   String hp = s >= 0 ? uri.substring(s + 3) : uri;
   int c = hp.lastIndexOf(':');
   hgHost = c > 0 ? hp.substring(0, c) : hp;
   hgPort = c > 0 ? hp.substring(c + 1).toInt() : 8883;
-  if (hgHost.isEmpty() || hgUser.isEmpty() || hgPass.isEmpty() || hgCa.indexOf("BEGIN CERTIFICATE") < 0) hgEnabled = false;
+  bool certLogin = hgCert.indexOf("BEGIN CERTIFICATE") >= 0 && hgKey.indexOf("PRIVATE KEY") >= 0;
+  if (hgHost.isEmpty() || hgUser.isEmpty() || (hgPass.isEmpty() && !certLogin) || hgCa.indexOf("BEGIN CERTIFICATE") < 0) hgEnabled = false;
+  if (!certLogin) { hgCert = ""; hgKey = ""; }
   hgCmdTopic   = "hg/" + hgUser + "/cmd";
   hgStateTopic = "hg/" + hgUser + "/state";
 }
@@ -104,7 +108,9 @@ static void hgTask(void*) {
         // port 8883 is on the client's list of TLS ports, so connect() encrypts
         bool ok = ip.fromString(hgHost) ? hgTls->connect(ip, hgPort) : hgTls->connect(hgHost.c_str(), hgPort);
         if (!ok) { hgLastErr = -10; }
-        else if (!hgMqtt->connect(hgUser.c_str(), hgUser.c_str(), hgPass.c_str(), hgStateTopic.c_str(), 1, true, "{\"online\":false}")) {
+        else if (!(hgCert.length()
+                   ? hgMqtt->connect(hgUser.c_str(), hgStateTopic.c_str(), 1, true, "{\"online\":false}")   // the certificate is the login
+                   : hgMqtt->connect(hgUser.c_str(), hgUser.c_str(), hgPass.c_str(), hgStateTopic.c_str(), 1, true, "{\"online\":false}"))) {
           hgLastErr = hgMqtt->state();
           hgTls->stop();
         } else {
@@ -134,6 +140,12 @@ static void hgStart() {
   hgTls = new ESP_SSLClient();
   hgTls->setClient(hgTcp);
   hgTls->setCACert(hgCa.c_str());          // pinned: only this certificate authority
+  if (hgCert.length()) {
+    hgTls->setCertificate(hgCert.c_str());
+    if (hgKey.indexOf("EC PRIVATE KEY") >= 0)  // elliptic-curve key, certificate signed by an RSA authority (AWS)
+      hgTls->setPrivateECKey(hgKey.c_str(), BR_KEYTYPE_SIGN, BR_KEYTYPE_RSA);
+    else hgTls->setPrivateKey(hgKey.c_str());
+  }
   hgTls->setBufferSizes(4096, 1024);
   hgTls->setTimeout(10000);
   hgTls->setDebugLevel(0);
@@ -221,6 +233,7 @@ void hgCloudInfo(JsonObject root) {
   c[F("en")] = hgEnabled;
   if (!hgEnabled) return;
   c[F("conn")] = (bool)hgConnected;
+  c[F("login")] = hgCert.length() ? F("cert") : F("password");
   c[F("connects")] = hgConnects;
   c[F("cmds")] = hgCmds;
   c[F("rejected")] = hgRejected;

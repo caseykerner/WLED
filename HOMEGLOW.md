@@ -42,6 +42,8 @@ official WLED at any time with a normal update.
    brightness, looks, playlists, segment colors and effects); settings, files, restarts and
    updates stay home-network only. `/json/info` reports `hgCloud` (connected, commands, and
    free memory before and after the encrypted connection).
+   hg4 adds certificate login (AWS IoT style): when the file also holds `cert` and `key`, the
+   controller logs in with its own certificate instead of a password.
 
 Only ESP32-family boards are built (ESP32, ESP32-S2, -S3, -C3). ESP8266 boards don't have the
 mDNS bug and stay on official WLED.
