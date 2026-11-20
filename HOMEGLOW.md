@@ -1,4 +1,4 @@
-# WLED 16.0.1 + HomeGlow fixes (16.0.1-hg2)
+# WLED 16.0.1 + HomeGlow fixes (16.0.1-hg3)
 
 This is official WLED 16.0.1 with a few fixes for ESP32 boards, built and offered by the
 [HomeGlow](https://apps.apple.com/app/id6821318234) app until the fixes are in an official WLED release.
@@ -35,6 +35,13 @@ official WLED at any time with a normal update.
    time is put back, internet time is asked again, and it is logged. `/json/info` reports
    `hgClockLog` (the last 12 clock jumps and large deliberate changes) and `hgClockFixes` (jumps
    undone since the last restart). Deliberate changes are logged, never undone.
+7. **Cloud test** (`wled00/hg_cloud.cpp`, new in hg3, test builds only). Off unless HomeGlow
+   writes `/hgcloud.wsec.json` (server, this controller's login and the server's pinned
+   certificate; protected like WLED's Wi-Fi passwords). Then the controller keeps one encrypted
+   MQTT connection out to that server and accepts everyday light control only (on/off,
+   brightness, looks, playlists, segment colors and effects); settings, files, restarts and
+   updates stay home-network only. `/json/info` reports `hgCloud` (connected, commands, and
+   free memory before and after the encrypted connection).
 
 Only ESP32-family boards are built (ESP32, ESP32-S2, -S3, -C3). ESP8266 boards don't have the
 mDNS bug and stay on official WLED.

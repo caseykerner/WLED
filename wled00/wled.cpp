@@ -60,6 +60,7 @@ void WLED::loop()
   handleTime();
   #ifdef ARDUINO_ARCH_ESP32
   hgDiagLoop();
+  hgCloudLoop();
   #endif
   #ifndef WLED_DISABLE_INFRARED
   handleIR();        // 2nd call to function needed for ESP32 to return valid results -- should be good for ESP8266, too

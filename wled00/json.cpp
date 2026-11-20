@@ -844,6 +844,7 @@ void serializeInfo(JsonObject root)
   #endif
   root[F("lwip")] = 0; //deprecated
   hgDiagInfo(root); // HomeGlow restart and crash history
+  hgCloudInfo(root); // HomeGlow cloud test status
   #ifndef WLED_DISABLE_OTA
   root[F("bootloaderSHA256")] = getBootloaderSHA256Hex();
   #endif

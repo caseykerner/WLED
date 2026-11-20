@@ -1,5 +1,5 @@
 {
-  "version": "16.0.1-hg2",
+  "version": "16.0.1-hg3",
   "base": "16.0.1",
   "tested":["ESP32","ESP32_Ethernet"]
 }

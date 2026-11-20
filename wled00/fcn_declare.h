@@ -536,6 +536,8 @@ void handleBootLoop();   // detect and handle bootloops
 void hgDiagBoot();       // HomeGlow: record why the controller restarted, and any crash
 void hgDiagLoop();
 void hgDiagInfo(JsonObject root);
+void hgCloudLoop();      // HomeGlow cloud (test): remote control through a HomeGlow server
+void hgCloudInfo(JsonObject root);
 #endif
 #ifndef ESP8266
 void bootloopCheckOTA(); // swap boot image if bootloop is detected instead of restoring config
