@@ -42,8 +42,12 @@ jobs:
       with:
         path: release
         merge-multiple: true
-    - name: Add HomeGlow manifest
-      run: cp .github/homeglow.json release/homeglow.json
+    - name: Add HomeGlow manifest, drop leftovers from earlier versions
+      run: |
+        cp .github/homeglow.json release/homeglow.json
+        VER=$(jq -r .version .github/homeglow.json)
+        find release -name '*.bin' ! -name "WLED_${VER}_*" -print -delete
+        ls release
     - name: Create draft release
       uses: softprops/action-gh-release@v2
       with:
