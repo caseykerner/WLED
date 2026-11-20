@@ -3,10 +3,9 @@ name: WLED Release CI
 # HomeGlow: started from the Actions tab ("Run workflow") with the release tag to create.
 # Builds every ESP32-family board and uploads them to a DRAFT release; publishing the
 # draft (by hand, on GitHub) creates the tag and makes it visible to HomeGlow.
+# No tag trigger: publishing the draft creates the tag, and a tag trigger would
+# rebuild and then fail trying to make a second release for the same tag.
 on:
-  push:
-    tags:
-      - '*'
   workflow_dispatch:
     inputs:
       tag:
