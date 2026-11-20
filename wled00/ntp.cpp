@@ -302,7 +302,10 @@ static bool checkNTPResponse()
   if (departed.sec == 0) return false;
   //basic half roundtrip estimation
   uint32_t serverDelay = toki.msDifference(arrived, departed);
-  uint32_t offset = (ntpPacketReceivedTime - ntpPacketSentTime - serverDelay) >> 1;
+  uint32_t roundtrip = ntpPacketReceivedTime - ntpPacketSentTime;
+  // HomeGlow fix: a late or mismatched reply can report a server delay longer than
+  // the whole roundtrip; the unsigned subtraction then wrapped to ~24.8 days.
+  uint32_t offset = (serverDelay < roundtrip) ? (roundtrip - serverDelay) >> 1 : 0;
   #ifdef WLED_DEBUG_NTP
   //the time the packet departed the NTP server
   toki.printTime(departed);

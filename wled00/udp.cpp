@@ -519,7 +519,12 @@ void handleNotifications()
   localIP = Network.localIP();
   //notifier and UDP realtime
   if (!packetSize || packetSize > UDP_IN_MAXSIZE) return;
-  if (!isSupp && notifierUdp.remoteIP() == localIP) return; //don't process broadcasts we send ourselves
+  if (!isSupp && notifierUdp.remoteIP() == localIP) { //don't process broadcasts we send ourselves
+    #ifdef ARDUINO_ARCH_ESP32
+    notifierUdp.flush(); // HomeGlow fix: discard it, or arduino-esp32 parsePacket() stays blocked (wled/WLED#5929)
+    #endif
+    return;
+  }
 
   uint8_t udpIn[packetSize +1];
   unsigned len;

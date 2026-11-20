@@ -58,6 +58,9 @@ void WLED::loop()
 #endif
 
   handleTime();
+  #ifdef ARDUINO_ARCH_ESP32
+  hgDiagLoop();
+  #endif
   #ifndef WLED_DISABLE_INFRARED
   handleIR();        // 2nd call to function needed for ESP32 to return valid results -- should be good for ESP8266, too
   #endif
@@ -463,6 +466,9 @@ void WLED::setup()
     errorFlag = ERR_FS_BEGIN;
   }
 
+  #ifdef ARDUINO_ARCH_ESP32
+  if (fsinit) hgDiagBoot(); // HomeGlow: record why we restarted
+  #endif
   handleBootLoop(); // check for bootloop and take action (requires WLED_FS)
   initPresetsFile();
   updateFSInfo();

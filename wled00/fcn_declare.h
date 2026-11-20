@@ -532,6 +532,11 @@ inline size_t getContiguousFreeHeap() { return ESP.getMaxFreeBlockSize(); } // r
 void *allocate_buffer(size_t size, uint32_t type);
 
 void handleBootLoop();   // detect and handle bootloops
+#ifdef ARDUINO_ARCH_ESP32
+void hgDiagBoot();       // HomeGlow: record why the controller restarted, and any crash
+void hgDiagLoop();
+void hgDiagInfo(JsonObject root);
+#endif
 #ifndef ESP8266
 void bootloopCheckOTA(); // swap boot image if bootloop is detected instead of restoring config
 #endif

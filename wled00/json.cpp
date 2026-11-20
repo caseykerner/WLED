@@ -843,6 +843,7 @@ void serializeInfo(JsonObject root)
   root[F("resetReason1")] = (int)rtc_get_reset_reason(1);
   #endif
   root[F("lwip")] = 0; //deprecated
+  hgDiagInfo(root); // HomeGlow restart and crash history
   #ifndef WLED_DISABLE_OTA
   root[F("bootloaderSHA256")] = getBootloaderSHA256Hex();
   #endif

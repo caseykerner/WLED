@@ -88,7 +88,13 @@ class Toki {
     }
 
     uint16_t millisecond() {
-      uint32_t ms = millis() - fullSecondMillis;
+      uint32_t now = millis();
+      // HomeGlow fix: if the reference point is ahead of now (setTime from another
+      // task between reading millis() and here, or a set within the first second
+      // after boot), the unsigned difference wraps to ~2^32 and the clock jumps
+      // 49.7 days ahead. Treat it as the start of this second instead.
+      if ((int32_t)(now - fullSecondMillis) < 0) fullSecondMillis = now;
+      uint32_t ms = now - fullSecondMillis;
       while (ms > 999) {
         ms -= 1000;
         fullSecondMillis += 1000;
@@ -127,7 +133,7 @@ class Toki {
       int32_t ms = offset - secs*1000;
       t.sec += secs;
       int32_t nms = t.ms + ms;
-      if (nms > 1000) {nms -= 1000; t.sec++;}
+      if (nms >= 1000) {nms -= 1000; t.sec++;}
       if (nms < 0) {nms += 1000; t.sec--;}
       t.ms = nms;
     }
