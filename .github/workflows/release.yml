@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to create (e.g. v16.0.1-hg3)'
-        required: true
-        default: 'v16.0.1-hg3'
+        description: 'Release tag (leave empty: v + the version in .github/homeglow.json)'
+        required: false
+        default: ''
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -47,12 +47,15 @@ jobs:
         VER=$(jq -r .version .github/homeglow.json)
         find release -name '*.bin' ! -name "WLED_${VER}_*" -print -delete
         ls release
+        TAG="${{ inputs.tag }}"; [ -z "$TAG" ] && TAG="v${VER}"
+        [ "$TAG" = "v${VER}" ] || { echo "Tag $TAG doesn't match homeglow.json version $VER"; exit 1; }
+        echo "TAG=$TAG" >> "$GITHUB_ENV"
     - name: Create draft release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: ${{ inputs.tag || github.ref_name }}
+        tag_name: ${{ env.TAG }}
         target_commitish: ${{ github.sha }}
-        name: WLED ${{ inputs.tag || github.ref_name }} (16.0.1 + HomeGlow fixes)
+        name: WLED ${{ env.TAG }} (16.0.1 + HomeGlow fixes)
         body_path: HOMEGLOW.md
         draft: true
         files: |
