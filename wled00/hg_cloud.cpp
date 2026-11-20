@@ -15,102 +15,131 @@
 //  - Commands are queued and applied in the main loop (never from the network task).
 //  - If the server can't be reached, nothing changes: the lights keep their own schedule.
 //
+// Encryption is BearSSL (ESP_SSLClient): WLED's ESP32 framework (Tasmota 2.0.18) is built
+// with TLS switched off, so the built-in client can't be used. The connection runs in its own
+// task, so the TLS handshake never stalls the lights.
+//
 // Topics: hg/<login>/cmd (in), hg/<login>/state (out, retained).
 // Reported in /json/info as hgCloud.
 #ifdef ARDUINO_ARCH_ESP32
 #include "wled.h"
-#include "mqtt_client.h"
+#include <WiFiClient.h>
+#include <ESP_SSLClient.h>
+#include <PubSubClient.h>
 
-#define HG_CLOUD_FILE  "/hgcloud.wsec.json"
+#define HG_CLOUD_FILE   "/hgcloud.wsec.json"
 #define HG_CLOUD_MAXCMD 2048
-#define HG_STATE_EVERY 60000UL
+#define HG_STATE_EVERY  60000UL
 
-static esp_mqtt_client_handle_t hgClient = nullptr;
-static String hgUri, hgUser, hgPass, hgCa, hgCmdTopic, hgStateTopic;
-static bool hgLoaded = false, hgEnabled = false;
+static String hgHost, hgUser, hgPass, hgCa, hgCmdTopic, hgStateTopic;
+static uint16_t hgPort = 8883;
+static bool hgLoaded = false, hgEnabled = false, hgStarted = false;
 static volatile bool hgConnected = false;
-static char* hgPending = nullptr;
+static char* hgPending = nullptr;          // newest command, handed from the cloud task to the main loop
+static char* hgOutState = nullptr;        // newest status, handed from the main loop to the cloud task
 static portMUX_TYPE hgMux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t hgCmds = 0, hgRejected = 0, hgConnects = 0, hgLastState = 0;
-static int32_t hgLastErr = 0;
-static uint32_t hgHeapBefore = 0, hgHeapConnected = 0;
+static volatile uint32_t hgCmds = 0, hgRejected = 0, hgConnects = 0;
+static volatile int32_t hgLastErr = 0;
+static volatile uint32_t hgHeapBefore = 0, hgHeapConnected = 0;
+static uint32_t hgLastState = 0;
 static volatile bool hgSendState = true;
 static uint8_t hgLastBri = 0; static int16_t hgLastPs = -2;
+
+static WiFiClient* hgTcp = nullptr;
+static ESP_SSLClient* hgTls = nullptr;
+static PubSubClient* hgMqtt = nullptr;
 
 static void hgLoad() {
   hgLoaded = true;
   File f = WLED_FS.open(HG_CLOUD_FILE, "r");
   if (!f) return;
-  StaticJsonDocument<2048> doc;   // the certificate is ~600 bytes
+  DynamicJsonDocument doc(2560);           // the certificate is ~600 bytes
   DeserializationError e = deserializeJson(doc, f);
   f.close();
   if (e) return;
   hgEnabled = doc["en"] | false;
-  hgUri  = doc["uri"]  | "";
+  String uri = doc["uri"] | "";             // mqtts://host:port
   hgUser = doc["user"] | "";
   hgPass = doc["pass"] | "";
   hgCa   = doc["ca"]   | "";
-  if (hgUri.isEmpty() || hgUser.isEmpty() || hgPass.isEmpty() || hgCa.indexOf("BEGIN CERTIFICATE") < 0) hgEnabled = false;
+  int s = uri.indexOf("://");
+  String hp = s >= 0 ? uri.substring(s + 3) : uri;
+  int c = hp.lastIndexOf(':');
+  hgHost = c > 0 ? hp.substring(0, c) : hp;
+  hgPort = c > 0 ? hp.substring(c + 1).toInt() : 8883;
+  if (hgHost.isEmpty() || hgUser.isEmpty() || hgPass.isEmpty() || hgCa.indexOf("BEGIN CERTIFICATE") < 0) hgEnabled = false;
   hgCmdTopic   = "hg/" + hgUser + "/cmd";
   hgStateTopic = "hg/" + hgUser + "/state";
 }
 
-static void hgEvent(void*, esp_event_base_t, int32_t id, void* data) {
-  esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)data;
-  switch (id) {
-    case MQTT_EVENT_CONNECTED:
-      hgConnected = true;
-      hgConnects++;
-      hgHeapConnected = ESP.getFreeHeap();
-      esp_mqtt_client_subscribe(hgClient, hgCmdTopic.c_str(), 1);
-      hgSendState = true;
-      break;
-    case MQTT_EVENT_DISCONNECTED:
+static void hgOnMessage(char* topic, uint8_t* payload, unsigned int len) {
+  if (len == 0 || len > HG_CLOUD_MAXCMD) { hgRejected++; return; }
+  char* buf = (char*)malloc(len + 1);
+  if (!buf) { hgRejected++; return; }
+  memcpy(buf, payload, len);
+  buf[len] = 0;
+  portENTER_CRITICAL(&hgMux);
+  char* old = hgPending;
+  hgPending = buf;                         // only the newest command matters
+  portEXIT_CRITICAL(&hgMux);
+  free(old);
+}
+
+// Connects (pinned certificate authority; the server's name is checked too when it's a
+// name rather than an address) and logs in, then keeps the connection serviced.
+static void hgTask(void*) {
+  uint32_t nextTry = 0;
+  for (;;) {
+    if (!hgMqtt->connected()) {
       hgConnected = false;
-      break;
-    case MQTT_EVENT_DATA: {
-      // whole, small messages only (a command is a few hundred bytes)
-      if (e->current_data_offset != 0 || e->data_len != e->total_data_len || e->data_len <= 0 || e->data_len > HG_CLOUD_MAXCMD) { hgRejected++; break; }
-      char* buf = (char*)malloc(e->data_len + 1);
-      if (!buf) { hgRejected++; break; }
-      memcpy(buf, e->data, e->data_len);
-      buf[e->data_len] = 0;
+      if ((int32_t)(millis() - nextTry) >= 0 && WLED_CONNECTED) {
+        nextTry = millis() + 15000;
+        hgHeapBefore = ESP.getFreeHeap();
+        hgTls->stop();
+        hgTls->setX509Time(toki.second());   // certificates are checked against the time
+        IPAddress ip;
+        bool ok = ip.fromString(hgHost) ? hgTls->connectSSL(ip, hgPort) : hgTls->connectSSL(hgHost.c_str(), hgPort);
+        if (!ok) { hgLastErr = -10; }
+        else if (!hgMqtt->connect(hgUser.c_str(), hgUser.c_str(), hgPass.c_str(), hgStateTopic.c_str(), 1, true, "{\"online\":false}")) {
+          hgLastErr = hgMqtt->state();
+          hgTls->stop();
+        } else {
+          hgMqtt->subscribe(hgCmdTopic.c_str(), 1);
+          hgConnected = true;
+          hgConnects++;
+          hgLastErr = 0;
+          hgHeapConnected = ESP.getFreeHeap();
+          hgSendState = true;
+        }
+      }
+    } else {
+      hgMqtt->loop();
+      char* out = nullptr;
       portENTER_CRITICAL(&hgMux);
-      char* old = hgPending;
-      hgPending = buf;            // only the newest command matters
+      out = hgOutState; hgOutState = nullptr;
       portEXIT_CRITICAL(&hgMux);
-      free(old);
-      break;
+      if (out) { hgMqtt->publish(hgStateTopic.c_str(), out, true); free(out); }
     }
-    case MQTT_EVENT_ERROR:
-      if (e->error_handle) hgLastErr = e->error_handle->esp_tls_last_esp_err ? e->error_handle->esp_tls_last_esp_err : (int32_t)e->error_handle->error_type;
-      break;
-    default: break;
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
 static void hgStart() {
-  hgHeapBefore = ESP.getFreeHeap();
-  esp_mqtt_client_config_t cfg = {};
-  cfg.uri = hgUri.c_str();
-  cfg.username = hgUser.c_str();
-  cfg.password = hgPass.c_str();
-  cfg.client_id = hgUser.c_str();
-  cfg.cert_pem = hgCa.c_str();                 // pinned: only this certificate authority
-  cfg.skip_cert_common_name_check = false;
-  cfg.keepalive = 60;
-  cfg.reconnect_timeout_ms = 15000;
-  cfg.network_timeout_ms = 10000;
-  cfg.buffer_size = 1024;
-  cfg.task_stack = 6144;
-  cfg.lwt_topic = hgStateTopic.c_str();
-  cfg.lwt_msg = "{\"online\":false}";
-  cfg.lwt_retain = 1;
-  cfg.lwt_qos = 1;
-  hgClient = esp_mqtt_client_init(&cfg);
-  if (!hgClient) { hgLastErr = -2; return; }
-  esp_mqtt_client_register_event(hgClient, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, hgEvent, nullptr);
-  if (esp_mqtt_client_start(hgClient) != ESP_OK) hgLastErr = -3;
+  hgStarted = true;
+  hgTcp = new WiFiClient();
+  hgTls = new ESP_SSLClient();
+  hgTls->setClient(hgTcp);
+  hgTls->setCACert(hgCa.c_str());          // pinned: only this certificate authority
+  hgTls->setBufferSizes(4096, 1024);
+  hgTls->setTimeout(10000);
+  hgTls->setDebugLevel(0);
+  hgMqtt = new PubSubClient(*hgTls);
+  hgMqtt->setServer(hgHost.c_str(), hgPort);
+  hgMqtt->setCallback(hgOnMessage);
+  hgMqtt->setBufferSize(HG_CLOUD_MAXCMD + 128);
+  hgMqtt->setKeepAlive(60);
+  hgMqtt->setSocketTimeout(10);
+  if (xTaskCreatePinnedToCore(hgTask, "hgCloud", 10240, nullptr, 1, nullptr, 0) != pdPASS) hgLastErr = -3;
 }
 
 // Keeps only everyday light control; everything else stays home-network only.
@@ -130,7 +159,6 @@ static void hgApply(char* cmd) {
   DeserializationError err = deserializeJson(*pDoc, cmd);
   JsonObject root = pDoc->as<JsonObject>();
   if (err || root.isNull()) { releaseJSONBufferLock(); hgRejected++; return; }
-  // drop anything that isn't everyday light control
   std::vector<String> drop;
   for (JsonPair kv : root) if (!hgAllowedKey(kv.key().c_str())) drop.push_back(kv.key().c_str());
   for (auto& k : drop) root.remove(k);
@@ -147,14 +175,20 @@ static void hgApply(char* cmd) {
   if (any) { hgCmds++; hgSendState = true; } else hgRejected++;
 }
 
-static void hgPublishState() {
-  if (!hgClient || !hgConnected) return;
+static void hgQueueState() {
   char msg[256];
-  snprintf(msg, sizeof(msg),
+  int n = snprintf(msg, sizeof(msg),
     "{\"online\":true,\"on\":%s,\"bri\":%u,\"ps\":%d,\"pl\":%d,\"heap\":%u,\"minHeap\":%u,\"up\":%lu,\"ver\":\"%s\"}",
     bri > 0 ? "true" : "false", bri, (int)currentPreset, (int)currentPlaylist,
     ESP.getFreeHeap(), ESP.getMinFreeHeap(), (unsigned long)(millis() / 1000), versionString);
-  esp_mqtt_client_publish(hgClient, hgStateTopic.c_str(), msg, 0, 1, 1);
+  char* out = (char*)malloc(n + 1);
+  if (!out) return;
+  memcpy(out, msg, n + 1);
+  portENTER_CRITICAL(&hgMux);
+  char* old = hgOutState;
+  hgOutState = out;
+  portEXIT_CRITICAL(&hgMux);
+  free(old);
   hgLastState = millis();
   hgLastBri = bri; hgLastPs = currentPreset;
 }
@@ -162,7 +196,7 @@ static void hgPublishState() {
 void hgCloudLoop() {
   if (!hgLoaded) hgLoad();
   if (!hgEnabled) return;
-  if (!hgClient) {
+  if (!hgStarted) {
     if (WLED_CONNECTED && toki.getTimeSource() >= TOKI_TS_SEC) hgStart();   // certificates need the right time
     return;
   }
@@ -171,10 +205,10 @@ void hgCloudLoop() {
   cmd = hgPending; hgPending = nullptr;
   portEXIT_CRITICAL(&hgMux);
   if (cmd) { hgApply(cmd); free(cmd); }
-  // state: after a command, when something changed here, and every minute
+  // status: after a command, when something changed here, and every minute
   if (hgConnected && (hgSendState || bri != hgLastBri || currentPreset != hgLastPs || millis() - hgLastState > HG_STATE_EVERY)) {
     hgSendState = false;
-    hgPublishState();
+    hgQueueState();
   }
 }
 
