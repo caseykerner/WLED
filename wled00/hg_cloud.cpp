@@ -24,6 +24,9 @@
 #ifdef ARDUINO_ARCH_ESP32
 #include "wled.h"
 #include <WiFiClient.h>
+// WLED builds everything with -DBEARSSL_SSL_BASIC (meant for ESP8266 boards), which turns off
+// elliptic-curve keys in this header-only client. The test certificates are P-256, so turn it off here.
+#undef BEARSSL_SSL_BASIC
 #include <ESP_SSLClient.h>
 #include <PubSubClient.h>
 
@@ -98,7 +101,8 @@ static void hgTask(void*) {
         hgTls->stop();
         hgTls->setX509Time(toki.second());   // certificates are checked against the time
         IPAddress ip;
-        bool ok = ip.fromString(hgHost) ? hgTls->connectSSL(ip, hgPort) : hgTls->connectSSL(hgHost.c_str(), hgPort);
+        // port 8883 is on the client's list of TLS ports, so connect() encrypts
+        bool ok = ip.fromString(hgHost) ? hgTls->connect(ip, hgPort) : hgTls->connect(hgHost.c_str(), hgPort);
         if (!ok) { hgLastErr = -10; }
         else if (!hgMqtt->connect(hgUser.c_str(), hgUser.c_str(), hgPass.c_str(), hgStateTopic.c_str(), 1, true, "{\"online\":false}")) {
           hgLastErr = hgMqtt->state();
