@@ -1,5 +1,5 @@
 {
-  "version": "16.0.1-hg1",
+  "version": "16.0.1-hg2",
   "base": "16.0.1",
-  "tested": []
+  "tested":["ESP32"]
 }

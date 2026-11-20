@@ -3,8 +3,10 @@
 //    stamped with the time once the clock is set
 //  - where it crashed and the call chain (Xtensa chips) or the crash address (RISC-V),
 //    saved in RTC memory during the crash and written to /crashlog.txt on the next boot
-// Reported in /json/info as hgReset, hgBootLog, hgCrashLog and hgFw. Nothing here
-// changes how WLED behaves. Crash capture is hooked in with -Wl,--wrap=esp_panic_handler.
+//  - a clock guard that undoes a clock jump nothing asked for and logs it (/clocklog.txt)
+// Reported in /json/info as hgReset, hgBootLog, hgCrashLog, hgClockLog, hgClockFixes and hgFw.
+// The clock guard is the only part that changes behaviour, and only after a clock jump.
+// Crash capture is hooked in with -Wl,--wrap=esp_panic_handler.
 #ifdef ARDUINO_ARCH_ESP32
 #include "wled.h"
 #include "esp_attr.h"
@@ -22,6 +24,10 @@
 #define HG_BOOTLOG_MAX  25
 #define HG_CRASHLOG     "/crashlog.txt"
 #define HG_CRASHLOG_MAX 6
+#define HG_CLOCKLOG     "/clocklog.txt"
+#define HG_CLOCKLOG_MAX 12
+#define HG_CLOCK_EVERY  30000UL   // check the clock every 30 seconds
+#define HG_CLOCK_SLACK  120       // seconds of disagreement allowed before it counts as a jump
 #define HG_MAGIC        0x4B43C0DEu
 #define HG_BT_DEPTH     16
 
@@ -189,7 +195,53 @@ static void hgStampNewest(const char* name, uint32_t epoch) {
 }
 
 // from the main loop: once the clock is set, stamp this boot's lines with the boot time (once)
+// Clock guard: once the clock is set, it should only move forward with millis().
+// If it moves by more than HG_CLOCK_SLACK seconds and nothing set the time (no NTP reply,
+// no time from the app, no sync packet), that is the known WLED clock-jump bug: put the
+// time back, ask NTP again, and log it. Deliberate big changes are logged but left alone.
+static uint32_t hgClockSec = 0, hgClockMs = 0, hgClockSets = 0;
+static uint16_t hgClockFixes = 0;
+
+static void hgClockLog(const char* what, uint32_t at, int32_t drift) {
+  String log = hgRead(HG_CLOCKLOG);
+  hgTrim(log, HG_CLOCKLOG_MAX);
+  char line[80];
+  snprintf(line, sizeof(line), "%lu %s %lds src=%u\n", (unsigned long)at, what, (long)drift, (unsigned)toki.getTimeSource());
+  log += line;
+  hgWrite(HG_CLOCKLOG, log);
+}
+
+static void hgClockGuard() {
+  uint32_t nowMs = millis();
+  if (hgClockSec && nowMs - hgClockMs < HG_CLOCK_EVERY) return;
+  if (toki.getTimeSource() < TOKI_TS_SEC) { hgClockSec = 0; return; }
+  uint32_t sec = toki.second();
+  uint32_t sets = toki.setCount();
+  if (hgClockSec) {
+    bool wasSet = (sets != hgClockSets);
+    // where the clock should be: carried on from our last look, or from the last deliberate set
+    uint32_t expected = wasSet ? toki.lastSetSec() + (nowMs - toki.lastSetAt()) / 1000
+                               : hgClockSec + (nowMs - hgClockMs) / 1000;
+    int32_t drift = (int32_t)(sec - expected);
+    if (drift > HG_CLOCK_SLACK || drift < -HG_CLOCK_SLACK) {
+      toki.setTime(expected, TOKI_NO_MS_ACCURACY, toki.getTimeSource());
+      sets = toki.setCount();
+      sec = expected;
+      updateLocalTime();
+      calculateSunriseAndSunset();
+      if (ntpEnabled) ntpLastSyncTime = NTP_NEVER; // confirm with NTP
+      hgClockFixes++;
+      hgClockLog("clock-jump-fixed", expected, drift);
+    } else if (wasSet) {
+      int32_t moved = (int32_t)(sec - (hgClockSec + (nowMs - hgClockMs) / 1000));
+      if (moved > HG_CLOCK_SLACK || moved < -HG_CLOCK_SLACK) hgClockLog("clock-set", sec, moved);
+    }
+  }
+  hgClockSec = sec; hgClockMs = nowMs; hgClockSets = sets;
+}
+
 void hgDiagLoop() {
+  hgClockGuard();
   if (hgStamped || hgRst < 0) return;
   if (toki.getTimeSource() < TOKI_TS_SEC) return;
   hgStamped = true;
@@ -204,5 +256,7 @@ void hgDiagInfo(JsonObject root) {
   root[F("hgBootLog")]  = hgRead(HG_BOOTLOG);
   root[F("hgCrashLog")] = hgRead(HG_CRASHLOG);
   root[F("hgFw")]       = hgFirmwareId();
+  root[F("hgClockLog")] = hgRead(HG_CLOCKLOG);
+  root[F("hgClockFixes")] = hgClockFixes;
 }
 #endif

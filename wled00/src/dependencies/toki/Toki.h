@@ -57,9 +57,18 @@ class Toki {
     uint32_t unix = 0;
     TickT tick = TickT::inactive;
     uint8_t timeSrc = TOKI_TS_NONE;
+    // HomeGlow: remember the last deliberate time set, so a jump nothing asked for can be spotted
+    uint32_t setCounter = 0, setSec = 0, setAtMillis = 0;
 
   public:
+    uint32_t setCount()   { return setCounter; }
+    uint32_t lastSetSec() { return setSec; }
+    uint32_t lastSetAt()  { return setAtMillis; }
+
     void setTime(Time t, uint8_t timeSource = TOKI_TS_MS) {
+      setCounter++;
+      setSec = t.sec;
+      setAtMillis = millis();
       fullSecondMillis = millis() - t.ms;
       unix = t.sec;
       timeSrc = timeSource;

@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to create (e.g. v16.0.1-hg1)'
+        description: 'Release tag to create (e.g. v16.0.1-hg2)'
         required: true
-        default: 'v16.0.1-hg1'
+        default: 'v16.0.1-hg2'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

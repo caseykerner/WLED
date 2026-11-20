@@ -1,4 +1,4 @@
-# WLED 16.0.1 + HomeGlow fixes (16.0.1-hg1)
+# WLED 16.0.1 + HomeGlow fixes (16.0.1-hg2)
 
 This is official WLED 16.0.1 with a few fixes for ESP32 boards, built and offered by the
 [HomeGlow](https://apps.apple.com/app/id6821318234) app until the fixes are in an official WLED release.
@@ -28,6 +28,13 @@ official WLED at any time with a normal update.
    `hgReset` (why it last restarted: power-on, brownout, software, crash…), `hgBootLog` (the last
    25 restarts with times), `hgCrashLog` (the last 6 crashes with the crash address and call
    chain) and `hgFw` (the build's id, to decode a crash). It changes nothing about how WLED runs.
+6. **Clock guard** (`wled00/hg_diag.cpp`, `Toki.h`, new in hg2). Every 30 seconds the clock is
+   compared with where it should be: carried forward from the last look, or from the last time
+   something deliberately set it (internet time, the app, a sync packet). If it is more than
+   2 minutes off, that is a jump nobody asked for (any cause, including ones not found yet): the
+   time is put back, internet time is asked again, and it is logged. `/json/info` reports
+   `hgClockLog` (the last 12 clock jumps and large deliberate changes) and `hgClockFixes` (jumps
+   undone since the last restart). Deliberate changes are logged, never undone.
 
 Only ESP32-family boards are built (ESP32, ESP32-S2, -S3, -C3). ESP8266 boards don't have the
 mDNS bug and stay on official WLED.
