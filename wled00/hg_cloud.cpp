@@ -146,7 +146,9 @@ static void hgStart() {
       hgTls->setPrivateECKey(hgKey.c_str(), BR_KEYTYPE_SIGN, BR_KEYTYPE_RSA);
     else hgTls->setPrivateKey(hgKey.c_str());
   }
-  hgTls->setBufferSizes(4096, 1024);
+  // AWS IoT doesn't shrink its TLS records on request, so a certificate (AWS) login needs room for a
+  // full 16 KB record; our own server (Mosquitto) fits in 4 KB.
+  hgTls->setBufferSizes(hgCert.length() ? 16384 : 4096, 1024);
   hgTls->setTimeout(10000);
   hgTls->setDebugLevel(0);
   hgMqtt = new PubSubClient(*hgTls);
