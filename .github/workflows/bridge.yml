@@ -32,7 +32,7 @@ jobs:
       working-directory: bridge/.pio/build/bridge_s3_n16r8
       run: |
         BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -1)
-        python -m esptool --chip esp32s3 merge_bin -o bridge-full.bin --flash_mode qio --flash_freq 80m --flash_size 16MB \
+        python -m esptool --chip esp32s3 merge_bin -o bridge-full.bin --flash_mode keep --flash_freq keep --flash_size keep \
           0x0 bootloader.bin 0x8000 partitions.bin 0xe000 "$BOOT_APP0" 0x10000 firmware.bin
         cp firmware.bin bridge-app.bin
         ls -la bridge-full.bin bridge-app.bin
@@ -45,9 +45,9 @@ jobs:
     - name: Draft release with the files (kept as a draft, never offered to anyone)
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: bridge-v0.1.0
+        tag_name: bridge-v0.1.1
         target_commitish: ${{ github.sha }}
-        name: HomeGlow Bridge 0.1.0 (prototype)
+        name: HomeGlow Bridge 0.1.1 (prototype)
         draft: true
         files: |
           bridge/.pio/build/bridge_s3_n16r8/bridge-full.bin
