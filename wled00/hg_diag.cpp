@@ -28,6 +28,8 @@
 #define HG_CLOCKLOG_MAX 12
 #define HG_CLOCK_EVERY  30000UL   // check the clock every 30 seconds
 #define HG_CLOCK_SLACK  120       // seconds of disagreement allowed before it counts as a jump
+#define HG_NETLOG       "/netlog.txt"
+#define HG_NETLOG_MAX   20
 #define HG_MAGIC        0x4B43C0DEu
 #define HG_BT_DEPTH     16
 
@@ -240,7 +242,74 @@ static void hgClockGuard() {
   hgClockSec = sec; hgClockMs = nowMs; hgClockSets = sets;
 }
 
+// Wi-Fi drops: the first disconnect after being online (reason code, free memory), then the
+// reconnect (how long it took, how many failed tries, last reason). Kept in /netlog.txt.
+// The Wi-Fi event runs in the network task, so it only records; the main loop writes the file.
+static portMUX_TYPE hgNetMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool hgNetUp = false, hgNetDownPending = false, hgNetUpPending = false;
+static volatile uint8_t hgNetFirstReason = 0, hgNetLastReason = 0;
+static volatile uint16_t hgNetTries = 0;
+static volatile uint32_t hgNetDownMs = 0, hgNetDownHeap = 0, hgNetDownMin = 0, hgNetUpMs = 0;
+static bool hgNetHooked = false;
+
+static void hgNetEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    uint8_t reason = info.wifi_sta_disconnected.reason;
+    portENTER_CRITICAL(&hgNetMux);
+    if (hgNetUp) {                                 // was online: this is the drop itself
+      hgNetUp = false; hgNetDownPending = true;
+      hgNetFirstReason = reason; hgNetTries = 0;
+      hgNetDownMs = millis(); hgNetDownHeap = ESP.getFreeHeap(); hgNetDownMin = ESP.getMinFreeHeap();
+    } else hgNetTries++;                           // a failed reconnect try
+    hgNetLastReason = reason;
+    portEXIT_CRITICAL(&hgNetMux);
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    portENTER_CRITICAL(&hgNetMux);
+    bool wasDown = hgNetDownMs != 0;
+    hgNetUp = true;
+    if (wasDown) { hgNetUpPending = true; hgNetUpMs = millis(); }
+    portEXIT_CRITICAL(&hgNetMux);
+  }
+}
+
+static void hgNetLog(const String& line) {
+  String log = hgRead(HG_NETLOG);
+  hgTrim(log, HG_NETLOG_MAX);
+  log += line; log += '\n';
+  hgWrite(HG_NETLOG, log);
+}
+
+static void hgNetFlush() {
+  if (!hgNetHooked) {
+    hgNetHooked = true;
+    hgNetUp = WiFi.isConnected();
+    WiFi.onEvent(hgNetEvent);
+  }
+  if (!hgNetDownPending && !hgNetUpPending) return;
+  uint32_t now = millis();
+  uint32_t epochNow = toki.getTimeSource() >= TOKI_TS_SEC ? toki.second() : 0;
+  char buf[160];
+  portENTER_CRITICAL(&hgNetMux);
+  bool down = hgNetDownPending, up = hgNetUpPending;
+  uint32_t downMs = hgNetDownMs, upMs = hgNetUpMs, heap = hgNetDownHeap, minh = hgNetDownMin;
+  uint8_t first = hgNetFirstReason, last = hgNetLastReason; uint16_t tries = hgNetTries;
+  hgNetDownPending = false;
+  if (up) { hgNetUpPending = false; hgNetDownMs = 0; }
+  portEXIT_CRITICAL(&hgNetMux);
+  if (down) {
+    snprintf(buf, sizeof(buf), "%lu wifi-down reason=%u heap=%lu minHeap=%lu",
+             (unsigned long)(epochNow ? epochNow - (now - downMs) / 1000 : 0), first, (unsigned long)heap, (unsigned long)minh);
+    hgNetLog(buf);
+  }
+  if (up) {
+    snprintf(buf, sizeof(buf), "%lu wifi-up after=%lus tries=%u lastReason=%u rssi=%d",
+             (unsigned long)(epochNow ? epochNow - (now - upMs) / 1000 : 0), (unsigned long)((upMs - downMs) / 1000), tries, last, (int)WiFi.RSSI());
+    hgNetLog(buf);
+  }
+}
+
 void hgDiagLoop() {
+  hgNetFlush();
   hgClockGuard();
   if (hgStamped || hgRst < 0) return;
   if (toki.getTimeSource() < TOKI_TS_SEC) return;
@@ -258,5 +327,6 @@ void hgDiagInfo(JsonObject root) {
   root[F("hgFw")]       = hgFirmwareId();
   root[F("hgClockLog")] = hgRead(HG_CLOCKLOG);
   root[F("hgClockFixes")] = hgClockFixes;
+  root[F("hgNetLog")]   = hgRead(HG_NETLOG);
 }
 #endif
