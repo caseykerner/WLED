@@ -45,7 +45,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.3.0"
+#define BRIDGE_VERSION    "0.3.1"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -99,6 +99,7 @@ struct TunReq {
 };
 static std::vector<TunReq> tunIn;          // still collecting parts (main task only)
 static std::vector<String> tunRefusedLog;  // last few refused requests, for the status page
+static std::vector<String> tunRecent;      // last few requests (method, controller, path, ms, size)
 
 // Work for the worker tasks.
 struct Job { bool tunnel; TunReq req; String login, body; };
@@ -482,6 +483,11 @@ static void runTunnel(TunReq& r) {
   if (r.method != "GET") ctrls[idx].pollSoon = true;
   tunDone++;
   uint32_t ms = millis() - r.started;
+  xSemaphoreTake(ctrlMx, portMAX_DELAY);
+  tunRecent.push_back(String(millis() / 1000) + "s " + r.method + " " + r.login + r.path.substring(0, 60) + " " + String(ms) + "ms " +
+                      String((uint32_t)o->payload.size()) + (o->zip ? "z" : "") + (r.zip ? "" : " noz"));
+  if (tunRecent.size() > 40) tunRecent.erase(tunRecent.begin());
+  xSemaphoreGive(ctrlMx);
   tunMsTotal += ms; wledMsTotal += wledMs; waitMsTotal += wait;
   if (ms > tunMsMax) tunMsMax = ms;
   post(o);
@@ -609,6 +615,8 @@ static void webStatusJson() {
   JsonArray a = d["controllers"].to<JsonArray>();
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
   for (auto& x : tunRefusedLog) rl.add(x);
+  JsonArray rc = d["recent"].to<JsonArray>();
+  for (auto& x : tunRecent) rc.add(x);
   for (int i = 0; i < nCtrls; i++) {
     Controller& c = ctrls[i];
     JsonObject o = a.add<JsonObject>();
