@@ -11,6 +11,10 @@
 //  - Controllers that already hold their own cloud connection (hg firmware with the cloud on)
 //    are left alone, so nothing is sent twice.
 //  - Remote commands are limited to everyday light control, like the firmware module.
+//  - Tunnel (0.2): the app can also make its normal home-network requests through the bridge
+//    (read and save looks, schedules, zones...) so every HomeGlow feature works away from home.
+//    Requests arrive on hg/req/<controller>, answers go to hg/resp/<app client>, both split into
+//    parts of up to 48 KB. Wi-Fi, network, firmware and password settings are never passed on.
 //  - Status light: blue = Wi-Fi setup, yellow = joining Wi-Fi, cyan = connecting to the cloud,
 //    green = connected (dim), red = cloud trouble.
 #include <Arduino.h>
@@ -25,13 +29,17 @@
 #include <WiFiManager.h>
 #include <LittleFS.h>
 #include <vector>
+#include <string>
+#include <algorithm>
 
 // Cloud login, loaded onto each bridge after flashing (POST /provision from the home network),
 // kept in /cloud.json. The firmware file itself holds no secrets.
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION   "0.1.0"
+#define BRIDGE_VERSION   "0.2.0"
+#define TUN_PART         48000
+#define TUN_MAX_BODY     (200 * 1024)
 #define CLOUD_FILE       "/cloud.json"
 #define LED_PIN          48
 #define POLL_EVERY_MS    30000UL
@@ -61,6 +69,18 @@ static String stateTopicSelf;
 
 struct Pending { String login; String body; };
 static std::vector<Pending> pending;     // filled from mqtt.loop(), emptied in loop(): same task
+
+// A tunnelled HTTP request, collected from its parts.
+struct TunReq {
+  String id, reply, login, method, path, ct;
+  int parts = 1, got = 0;
+  bool bad = false;
+  std::string body;
+  uint32_t started = 0;
+};
+static std::vector<TunReq> tunIn;        // still collecting parts
+static std::vector<TunReq> tunReady;     // complete, waiting to run
+static uint32_t tunDone = 0, tunRefused = 0;
 
 static void led(uint8_t r, uint8_t g, uint8_t b) { neopixelWrite(LED_PIN, r, g, b); }
 
@@ -145,7 +165,35 @@ static bool allowedSegKey(const char* k) {
   return false;
 }
 
+static void onTunnel(const String& login, uint8_t* payload, unsigned int len) {
+  unsigned int nl = 0;
+  while (nl < len && payload[nl] != '\n') nl++;
+  if (nl >= len) { tunRefused++; return; }
+  JsonDocument h;
+  if (deserializeJson(h, (const char*)payload, nl)) { tunRefused++; return; }
+  String id = h["id"] | "";
+  if (id.isEmpty()) { tunRefused++; return; }
+  int part = h["i"] | 0, parts = h["n"] | 1;
+  TunReq* r = nullptr;
+  for (auto& x : tunIn) if (x.id == id) r = &x;
+  if (!r) {
+    if (part != 0) { tunRefused++; return; }
+    tunIn.push_back(TunReq()); r = &tunIn.back();
+    r->id = id; r->reply = h["c"] | ""; r->login = login; r->method = h["m"] | "GET";
+    r->path = h["p"] | "/"; r->ct = h["ct"] | ""; r->parts = parts < 1 ? 1 : parts; r->started = millis();
+  }
+  if (part != r->got || r->body.size() + (len - nl - 1) > TUN_MAX_BODY) r->bad = true;
+  else r->body.append((const char*)payload + nl + 1, len - nl - 1);
+  r->got++;
+  if (r->got >= r->parts) {
+    tunReady.push_back(*r);
+    for (size_t i = 0; i < tunIn.size(); i++) if (tunIn[i].id == id) { tunIn.erase(tunIn.begin() + i); break; }
+  }
+}
+
 static void onMessage(char* topic, uint8_t* payload, unsigned int len) {
+  String tt(topic);
+  if (tt.startsWith("hg/req/")) { onTunnel(tt.substring(7), payload, len); return; }
   cmdsIn++;
   String t(topic);                         // hg/<login>/cmd
   int a = t.indexOf('/'), b = t.lastIndexOf('/');
@@ -217,6 +265,100 @@ static void apply(const Pending& p) {
   c->pollSoon = true;                      // report the new state right away
 }
 
+// What the tunnel passes on. The app needs to read and write looks, schedules, zones and light
+// settings; it never needs Wi-Fi, network, access-point, firmware or password settings.
+static bool tunAllowed(TunReq& r) {
+  String p = r.path, bare = p;
+  int q = bare.indexOf('?'); if (q >= 0) bare = bare.substring(0, q);
+  String lower = p; lower.toLowerCase();
+  if (lower.indexOf("sec") >= 0 || lower.indexOf("update") >= 0 || lower.indexOf("reset") >= 0 ||
+      lower.indexOf("settings") >= 0 || lower.indexOf("..") >= 0) return false;
+  if (r.method == "GET") {
+    if (bare.startsWith("/json")) return true;
+    if (bare.endsWith(".json") && lower.indexOf("cfg") < 0) return true;
+    if (bare == "/edit") {
+      if (lower.indexOf("list=") >= 0) return true;
+      if (lower.indexOf("func=delete") >= 0 && lower.indexOf(".json") >= 0 && lower.indexOf("cfg") < 0) return true;
+    }
+    return false;
+  }
+  if (r.method == "DELETE") return bare == "/edit" && lower.indexOf("cfg") < 0 &&
+                                   String(r.body.c_str()).indexOf(".json") >= 0 && String(r.body.c_str()).indexOf("cfg") < 0;
+  if (r.method != "POST") return false;
+  if (bare == "/json/state" || bare == "/json/si" || bare == "/json") return true;
+  if (bare == "/json/cfg") {                 // light settings yes; network, Wi-Fi, AP and update settings never
+    JsonDocument d;
+    if (deserializeJson(d, r.body)) return false;
+    const char* blocked[] = {"nw", "ap", "eth", "ota", "wifi"};
+    for (const char* k : blocked) d.remove(k);
+    r.body.clear();
+    serializeJson(d, r.body);
+    return true;
+  }
+  if (bare == "/upload") {                   // only HomeGlow's own data files
+    String b = String(r.body.substr(0, 600).c_str());
+    int f = b.indexOf("filename=\"");
+    if (f < 0) return false;
+    int e = b.indexOf('"', f + 10);
+    String name = b.substring(f + 10, e); name.toLowerCase();
+    return name.endsWith(".json") && name.indexOf("cfg") < 0 && name.indexOf("sec") < 0;
+  }
+  return false;
+}
+
+static void tunReply(const TunReq& r, int status, const String& ct, const std::string& body) {
+  if (!mqtt.connected() || r.reply.isEmpty()) return;
+  String topic = "hg/resp/" + r.reply;
+  int parts = body.empty() ? 1 : (int)((body.size() + TUN_PART - 1) / TUN_PART);
+  for (int i = 0; i < parts; i++) {
+    JsonDocument h;
+    h["id"] = r.id; h["s"] = status; h["i"] = i; h["n"] = parts;
+    if (i == 0 && ct.length()) h["ct"] = ct;
+    String head; serializeJson(h, head); head += '\n';
+    size_t off = (size_t)i * TUN_PART, n = body.empty() ? 0 : std::min((size_t)TUN_PART, body.size() - off);
+    mqtt.beginPublish(topic.c_str(), head.length() + n, false);
+    mqtt.write((const uint8_t*)head.c_str(), head.length());
+    if (n) mqtt.write((const uint8_t*)body.data() + off, n);
+    mqtt.endPublish();
+    mqtt.loop();
+  }
+}
+
+static void tunRun(TunReq& r) {
+  Controller* c = byLogin(r.login);
+  if (r.bad || !c || c->ip.isEmpty()) { tunRefused++; tunReply(r, r.bad ? 413 : 404, "", ""); return; }
+  if (!tunAllowed(r)) { tunRefused++; tunReply(r, 403, "", ""); return; }
+  HTTPClient http;
+  http.setTimeout(r.body.size() > 20000 ? 30000 : 6000);
+  http.setConnectTimeout(3000);
+  if (!http.begin("http://" + c->ip + r.path)) { tunReply(r, 502, "", ""); return; }
+  if (r.ct.length()) http.addHeader("Content-Type", r.ct);
+  const char* keys[] = {"Content-Type"};
+  http.collectHeaders(keys, 1);
+  int code = r.body.empty() && r.method == "GET" ? http.GET()
+           : http.sendRequest(r.method.c_str(), (uint8_t*)r.body.data(), r.body.size());
+  std::string out;
+  String ct;
+  if (code > 0) {
+    ct = http.header("Content-Type");
+    WiFiClient* s = http.getStreamPtr();
+    int total = http.getSize();
+    uint8_t buf[1024];
+    uint32_t t0 = millis();
+    while (http.connected() && (total < 0 || (int)out.size() < total) && millis() - t0 < 30000) {
+      int a = s->available();
+      if (a <= 0) { delay(2); continue; }
+      int n = s->readBytes(buf, std::min(a, (int)sizeof(buf)));
+      out.append((const char*)buf, n);
+      if (out.size() > TUN_MAX_BODY) break;
+    }
+  }
+  http.end();
+  tunDone++;
+  tunReply(r, code > 0 ? code : 504, ct, out);
+  if (r.method != "GET") c->pollSoon = true;
+}
+
 static void connectCloud() {
   lastTry = millis();
   led(0, 40, 40);
@@ -225,6 +367,7 @@ static void connectCloud() {
   if (mqtt.connect(cloudId.c_str(), willTopic.c_str(), 1, true, "{\"online\":false}")) {
     connects++; lastMqttErr = 0;
     mqtt.subscribe("hg/+/cmd", 1);
+    mqtt.subscribe("hg/req/+", 0);
     JsonDocument me; me["online"] = true; me["ver"] = BRIDGE_VERSION; me["ip"] = WiFi.localIP().toString();
     String s; serializeJson(me, s);
     mqtt.publish(stateTopicSelf.c_str(), s.c_str(), true);
@@ -273,6 +416,7 @@ static void webStatusJson() {
   d["ver"] = BRIDGE_VERSION; d["id"] = cloudId; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected(); d["err"] = lastMqttErr;
   d["connects"] = connects; d["in"] = cmdsIn; d["sent"] = cmdsSent; d["refused"] = cmdsRefused;
   d["heap"] = ESP.getFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
+  d["tunnel"] = tunDone; d["tunnelRefused"] = tunRefused;
   JsonArray a = d["controllers"].to<JsonArray>();
   for (auto& c : ctrls) {
     JsonObject o = a.add<JsonObject>();
@@ -345,7 +489,7 @@ void setup() {
     tls.setCertificate(cloudCert.c_str());
     tls.setPrivateKey(cloudKey.c_str());
   }
-  mqtt.setBufferSize(MAX_CMD + 256);
+  mqtt.setBufferSize(TUN_PART + 2048);     // in the 8 MB PSRAM
   mqtt.setKeepAlive(60);
   mqtt.setCallback(onMessage);
 
@@ -371,6 +515,13 @@ void loop() {
   std::vector<Pending> todo;
   todo.swap(pending);
   for (auto& p : todo) apply(p);
+  if (!tunReady.empty()) {                 // one tunnelled request per pass
+    TunReq r = tunReady.front();
+    tunReady.erase(tunReady.begin());
+    tunRun(r);
+  }
+  for (size_t i = 0; i < tunIn.size(); i++)  // parts that never all arrived
+    if (millis() - tunIn[i].started > 30000) { tunIn.erase(tunIn.begin() + i); break; }
 
   if (millis() - lastScan > SCAN_EVERY_MS) scan();
   for (auto& c : ctrls) {
