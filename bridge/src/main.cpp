@@ -45,7 +45,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.3.1"
+#define BRIDGE_VERSION    "0.3.2"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -204,9 +204,14 @@ static mz_bool zipPut(const void* buf, int len, void* user) {
 }
 static std::string deflate(const std::string& in) {
   std::string out;
-  out.reserve(in.size() / 4);
-  // The compressor's ~300 KB of tables come from PSRAM (malloc prefers it for large blocks).
-  if (!tdefl_compress_mem_to_output(in.data(), in.size(), zipPut, &out, 64 | TDEFL_GREEDY_PARSING_FLAG)) out.clear();
+  // The compressor's ~320 KB of tables go in PSRAM: plain malloc only uses internal memory here.
+  tdefl_compressor* c = (tdefl_compressor*)ps_malloc(sizeof(tdefl_compressor));
+  if (!c) return out;
+  out.reserve(in.size() / 3);
+  bool ok = tdefl_init(c, zipPut, &out, 64 | TDEFL_GREEDY_PARSING_FLAG) == TDEFL_STATUS_OKAY &&
+            tdefl_compress_buffer(c, in.data(), in.size(), TDEFL_FINISH) == TDEFL_STATUS_DONE;
+  free(c);
+  if (!ok) out.clear();
   return out;
 }
 
