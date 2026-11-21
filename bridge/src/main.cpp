@@ -160,18 +160,18 @@ static int findCtrl(const String& login, String& ip) {
 // length and chunked answers).
 class StrStream : public Stream {
  public:
-  explicit StrStream(std::string& s, size_t max) : _s(s), _max(max) {}
+  explicit StrStream(std::string& s, size_t max) : buf_(s), limit_(max) {}
   size_t write(uint8_t c) override { return write(&c, 1); }
   size_t write(const uint8_t* b, size_t n) override {
-    if (_s.size() + n > _max) return 0;
-    _s.append((const char*)b, n); return n;
+    if (buf_.size() + n > limit_) return 0;
+    buf_.append((const char*)b, n); return n;
   }
   int available() override { return 0; }
   int read() override { return -1; }
   int peek() override { return -1; }
   void flush() override {}
  private:
-  std::string& _s; size_t _max;
+  std::string& buf_; size_t limit_;
 };
 
 // One request to a controller. Returns the HTTP status (or a negative HTTPClient error).
