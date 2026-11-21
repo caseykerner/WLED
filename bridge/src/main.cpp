@@ -37,7 +37,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION   "0.2.2"
+#define BRIDGE_VERSION   "0.2.3"
 #define TUN_PART         48000
 #define TUN_MAX_BODY     (200 * 1024)
 #define CLOUD_FILE       "/cloud.json"
@@ -313,6 +313,20 @@ static bool tunAllowed(TunReq& r) {
   return false;
 }
 
+// The TLS socket can take only part of a large write; PubSubClient doesn't retry, and a short
+// write breaks the MQTT stream (AWS then drops the connection). Write in small pieces until done.
+static uint32_t shortWrites = 0;
+static bool writeAll(const uint8_t* p, size_t n) {
+  size_t off = 0;
+  uint32_t t0 = millis();
+  while (off < n && millis() - t0 < 15000) {
+    size_t w = mqtt.write(p + off, std::min((size_t)1024, n - off));
+    if (w == 0) { shortWrites++; delay(5); continue; }
+    off += w;
+  }
+  return off == n;
+}
+
 static void tunReply(const TunReq& r, int status, const String& ct, const std::string& body) {
   if (!mqtt.connected() || r.reply.isEmpty()) return;
   String topic = "hg/resp/" + r.reply;
@@ -323,9 +337,9 @@ static void tunReply(const TunReq& r, int status, const String& ct, const std::s
     if (i == 0 && ct.length()) h["ct"] = ct;
     String head; serializeJson(h, head); head += '\n';
     size_t off = (size_t)i * TUN_PART, n = body.empty() ? 0 : std::min((size_t)TUN_PART, body.size() - off);
-    mqtt.beginPublish(topic.c_str(), head.length() + n, false);
-    mqtt.write((const uint8_t*)head.c_str(), head.length());
-    if (n) mqtt.write((const uint8_t*)body.data() + off, n);
+    if (!mqtt.beginPublish(topic.c_str(), head.length() + n, false)) return;
+    if (!writeAll((const uint8_t*)head.c_str(), head.length())) return;
+    if (n && !writeAll((const uint8_t*)body.data() + off, n)) return;
     mqtt.endPublish();
     mqtt.loop();
   }
@@ -423,7 +437,7 @@ static void webStatusJson() {
   d["ver"] = BRIDGE_VERSION; d["id"] = cloudId; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected(); d["err"] = lastMqttErr;
   d["connects"] = connects; d["in"] = cmdsIn; d["sent"] = cmdsSent; d["refused"] = cmdsRefused;
   d["heap"] = ESP.getFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
-  d["tunnel"] = tunDone; d["tunnelRefused"] = tunRefused;
+  d["tunnel"] = tunDone; d["tunnelRefused"] = tunRefused; d["shortWrites"] = shortWrites;
   JsonArray rl = d["refusedLog"].to<JsonArray>();
   for (auto& x : tunRefusedLog) rl.add(x);
   JsonArray a = d["controllers"].to<JsonArray>();
