@@ -48,6 +48,10 @@ official WLED at any time with a normal update.
    watchdog, and a restart in the middle of a handshake backs the cloud off (5 to 60 minutes).
    hg5 also logs Wi-Fi drops (reason code and free memory) and reconnects in /netlog.txt,
    reported in /json/info as hgNetLog.
+   hg6: memory guard (no handshake without memory to spare; the cloud lets go of its connection
+   if free memory gets tight, so Wi-Fi can always reconnect), the largest free block in
+   /json/info (hgMaxBlock, hgCloud.block/minBlock), cloud drop reasons, and an optional "rx"
+   receive-buffer size in the cloud file.
 
 Only ESP32-family boards are built (ESP32, ESP32-S2, -S3, -C3). ESP8266 boards don't have the
 mDNS bug and stay on official WLED.

@@ -36,6 +36,16 @@
 
 static String hgHost, hgUser, hgPass, hgCa, hgCert, hgKey, hgCmdTopic, hgStateTopic;
 static uint16_t hgPort = 8883;
+static uint16_t hgRx = 4096;               // TLS receive buffer ("rx" in the file); AWS needs room for full 16 KB records
+// Memory guard: Wi-Fi itself needs free memory to reconnect after a drop, and it matters more than the
+// cloud. Don't start a handshake unless this much is free in one piece, and let go of the connection
+// if the largest free block falls below the low mark while connected.
+#define HG_START_FREE   45000   // free memory needed beyond the receive buffer before a handshake
+#define HG_LOW_FREE     30000   // let go of the connection below this much free memory...
+#define HG_LOW_BLOCK    12000   // ...or when the largest free piece is smaller than this
+static volatile uint32_t hgDrops = 0, hgGuardDrops = 0, hgSkips = 0;
+static volatile int32_t hgLastDrop = 0;
+static volatile uint32_t hgLastDropAt = 0, hgMinBlock = 0xFFFFFFFF;
 static bool hgLoaded = false, hgEnabled = false, hgStarted = false;
 static volatile bool hgConnected = false;
 static char* hgPending = nullptr;          // newest command, handed from the cloud task to the main loop
@@ -73,6 +83,7 @@ static void hgLoad() {
   hgUser = doc["user"] | "";
   hgPass = doc["pass"] | "";
   hgCa   = doc["ca"]   | "";
+  int rx = doc["rx"] | 0;
   hgCert = doc["cert"] | "";               // optional: this controller's own certificate and key
   hgKey  = doc["key"]  | "";               // (AWS IoT style login instead of a password)
   int s = uri.indexOf("://");
@@ -83,6 +94,7 @@ static void hgLoad() {
   bool certLogin = hgCert.indexOf("BEGIN CERTIFICATE") >= 0 && hgKey.indexOf("PRIVATE KEY") >= 0;
   if (hgHost.isEmpty() || hgUser.isEmpty() || (hgPass.isEmpty() && !certLogin) || hgCa.indexOf("BEGIN CERTIFICATE") < 0) hgEnabled = false;
   if (!certLogin) { hgCert = ""; hgKey = ""; }
+  hgRx = rx >= 512 && rx <= 16384 ? rx : (certLogin ? 16384 : 4096);
   hgCmdTopic   = "hg/" + hgUser + "/cmd";
   hgStateTopic = "hg/" + hgUser + "/state";
 }
@@ -106,9 +118,18 @@ static void hgTask(void*) {
   uint32_t nextTry = 0;
   for (;;) {
     if (!hgMqtt->connected()) {
+      if (hgConnected) {                     // it was up: note why it went
+        hgDrops++; hgLastDrop = hgMqtt->state();
+        hgLastDropAt = toki.getTimeSource() >= TOKI_TS_SEC ? toki.second() : 0;
+      }
       hgConnected = false;
       if ((int32_t)(millis() - nextTry) >= 0 && (int32_t)(millis() - hgHoldUntil) >= 0 && WLED_CONNECTED) {
         nextTry = millis() + 15000;
+        if (ESP.getFreeHeap() < HG_START_FREE + hgRx || heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < hgRx + 8192) {
+          hgSkips++; hgLastErr = -30;          // not enough memory to spare right now: try again in 15 s
+          vTaskDelay(pdMS_TO_TICKS(20));
+          continue;
+        }
         hgHeapBefore = ESP.getFreeHeap();
         hgTls->stop();
         hgTls->setX509Time(toki.second());   // certificates are checked against the time
@@ -134,6 +155,14 @@ static void hgTask(void*) {
         }
       }
     } else {
+      uint32_t block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      if (block < hgMinBlock) hgMinBlock = block;
+      if (block < HG_LOW_BLOCK || ESP.getFreeHeap() < HG_LOW_FREE) {   // memory is tight: Wi-Fi and the lights come first
+        hgGuardDrops++; hgLastErr = -31;
+        hgMqtt->disconnect(); hgTls->stop(); hgConnected = false;
+        vTaskDelay(pdMS_TO_TICKS(60000));    // give it a minute before trying again
+        continue;
+      }
       hgMqtt->loop();
       char* out = nullptr;
       portENTER_CRITICAL(&hgMux);
@@ -169,7 +198,7 @@ static void hgStart() {
   }
   // AWS IoT doesn't shrink its TLS records on request, so a certificate (AWS) login needs room for a
   // full 16 KB record; our own server (Mosquitto) fits in 4 KB.
-  hgTls->setBufferSizes(hgCert.length() ? 16384 : 4096, 1024);
+  hgTls->setBufferSizes(hgRx, 1024);
   hgTls->setTimeout(10000);
   hgTls->setDebugLevel(0);
   hgMqtt = new PubSubClient(*hgTls);
@@ -264,5 +293,12 @@ void hgCloudInfo(JsonObject root) {
   if (hgStrikes) { c[F("strikes")] = hgStrikes; c[F("holdSec")] = (int32_t)(hgHoldUntil - millis()) > 0 ? (hgHoldUntil - millis()) / 1000 : 0; }
   c[F("heapBefore")] = hgHeapBefore;       // free memory just before the encrypted connection started
   c[F("heapConnected")] = hgHeapConnected; // free memory right after it connected
+  c[F("rx")] = hgRx;
+  c[F("block")] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);   // largest free piece right now
+  if (hgMinBlock != 0xFFFFFFFF) c[F("minBlock")] = hgMinBlock;         // smallest it got while connected
+  c[F("drops")] = hgDrops;
+  if (hgDrops) { c[F("lastDrop")] = hgLastDrop; c[F("lastDropAt")] = hgLastDropAt; }
+  if (hgGuardDrops) c[F("guardDrops")] = hgGuardDrops;
+  if (hgSkips) c[F("skips")] = hgSkips;
 }
 #endif

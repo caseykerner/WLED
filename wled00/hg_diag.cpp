@@ -249,7 +249,7 @@ static portMUX_TYPE hgNetMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool hgNetUp = false, hgNetDownPending = false, hgNetUpPending = false;
 static volatile uint8_t hgNetFirstReason = 0, hgNetLastReason = 0;
 static volatile uint16_t hgNetTries = 0;
-static volatile uint32_t hgNetDownMs = 0, hgNetDownHeap = 0, hgNetDownMin = 0, hgNetUpMs = 0;
+static volatile uint32_t hgNetDownMs = 0, hgNetDownHeap = 0, hgNetDownMin = 0, hgNetUpMs = 0, hgNetDownBlock = 0;
 static bool hgNetHooked = false;
 
 static void hgNetEvent(arduino_event_id_t event, arduino_event_info_t info) {
@@ -260,6 +260,7 @@ static void hgNetEvent(arduino_event_id_t event, arduino_event_info_t info) {
       hgNetUp = false; hgNetDownPending = true;
       hgNetFirstReason = reason; hgNetTries = 0;
       hgNetDownMs = millis(); hgNetDownHeap = ESP.getFreeHeap(); hgNetDownMin = ESP.getMinFreeHeap();
+      hgNetDownBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     } else hgNetTries++;                           // a failed reconnect try
     hgNetLastReason = reason;
     portEXIT_CRITICAL(&hgNetMux);
@@ -297,8 +298,8 @@ static void hgNetFlush() {
   if (up) { hgNetUpPending = false; hgNetDownMs = 0; }
   portEXIT_CRITICAL(&hgNetMux);
   if (down) {
-    snprintf(buf, sizeof(buf), "%lu wifi-down reason=%u heap=%lu minHeap=%lu",
-             (unsigned long)(epochNow ? epochNow - (now - downMs) / 1000 : 0), first, (unsigned long)heap, (unsigned long)minh);
+    snprintf(buf, sizeof(buf), "%lu wifi-down reason=%u heap=%lu minHeap=%lu block=%lu",
+             (unsigned long)(epochNow ? epochNow - (now - downMs) / 1000 : 0), first, (unsigned long)heap, (unsigned long)minh, (unsigned long)hgNetDownBlock);
     hgNetLog(buf);
   }
   if (up) {
@@ -322,6 +323,7 @@ void hgDiagLoop() {
 void hgDiagInfo(JsonObject root) {
   root[F("hgReset")]    = hgResetText();
   root[F("hgMinHeap")]  = ESP.getMinFreeHeap();
+  root[F("hgMaxBlock")] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   root[F("hgBootLog")]  = hgRead(HG_BOOTLOG);
   root[F("hgCrashLog")] = hgRead(HG_CRASHLOG);
   root[F("hgFw")]       = hgFirmwareId();
