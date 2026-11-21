@@ -1,0 +1,44 @@
+name: HomeGlow Bridge
+
+# Builds the bridge firmware (bridge/) for the ESP32-S3 N16R8 and keeps it as a download:
+#   bridge-full.bin  - bootloader + partitions + app, flash at 0x0 on a new board
+#   bridge-app.bin   - app only, for the bridge's own update page
+on:
+  push:
+    branches: [homeglow-bridge]
+    paths: ['bridge/**', '.github/workflows/bridge.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - uses: actions/cache@v4
+      with:
+        path: ~/.platformio
+        key: pio-bridge-${{ hashFiles('bridge/platformio.ini') }}
+    - run: pip install platformio esptool
+    - name: Build
+      working-directory: bridge
+      run: pio run -e bridge_s3_n16r8
+    - name: Make the full image
+      working-directory: bridge/.pio/build/bridge_s3_n16r8
+      run: |
+        BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -1)
+        python -m esptool --chip esp32s3 merge_bin -o bridge-full.bin --flash_mode qio --flash_freq 80m --flash_size 16MB \
+          0x0 bootloader.bin 0x8000 partitions.bin 0xe000 "$BOOT_APP0" 0x10000 firmware.bin
+        cp firmware.bin bridge-app.bin
+        ls -la bridge-full.bin bridge-app.bin
+    - uses: actions/upload-artifact@v4
+      with:
+        name: homeglow-bridge
+        path: |
+          bridge/.pio/build/bridge_s3_n16r8/bridge-full.bin
+          bridge/.pio/build/bridge_s3_n16r8/bridge-app.bin

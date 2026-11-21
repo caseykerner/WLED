@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - '*'
+      - '!homeglow-bridge'   # the bridge branch builds only the bridge (bridge.yml)
   pull_request:
 
 jobs:
