@@ -48,6 +48,14 @@ static uint32_t hgLastState = 0;
 static volatile bool hgSendState = true;
 static uint8_t hgLastBri = 0; static int16_t hgLastPs = -2;
 
+// Crash-loop guard: set while a TLS handshake runs, kept across a restart (not across power loss).
+// If the controller restarts with it still set, the handshake took it down, so wait before trying again.
+#define HG_HANDSHAKE_MAGIC 0x4847484BUL
+static RTC_NOINIT_ATTR uint32_t hgRtcHandshake;
+static RTC_NOINIT_ATTR uint32_t hgRtcStrikes;
+static uint32_t hgHoldUntil = 0;
+static uint32_t hgStrikes = 0;
+
 static WiFiClient* hgTcp = nullptr;
 static ESP_SSLClient* hgTls = nullptr;
 static PubSubClient* hgMqtt = nullptr;
@@ -99,14 +107,17 @@ static void hgTask(void*) {
   for (;;) {
     if (!hgMqtt->connected()) {
       hgConnected = false;
-      if ((int32_t)(millis() - nextTry) >= 0 && WLED_CONNECTED) {
+      if ((int32_t)(millis() - nextTry) >= 0 && (int32_t)(millis() - hgHoldUntil) >= 0 && WLED_CONNECTED) {
         nextTry = millis() + 15000;
         hgHeapBefore = ESP.getFreeHeap();
         hgTls->stop();
         hgTls->setX509Time(toki.second());   // certificates are checked against the time
+        hgRtcHandshake = HG_HANDSHAKE_MAGIC;   // cleared below once the handshake is over, either way
         IPAddress ip;
         // port 8883 is on the client's list of TLS ports, so connect() encrypts
         bool ok = ip.fromString(hgHost) ? hgTls->connect(ip, hgPort) : hgTls->connect(hgHost.c_str(), hgPort);
+        hgRtcHandshake = 0;
+        if (ok) hgRtcStrikes = 0;
         if (!ok) { hgLastErr = -10; }
         else if (!(hgCert.length()
                    ? hgMqtt->connect(hgUser.c_str(), hgStateTopic.c_str(), 1, true, "{\"online\":false}")   // the certificate is the login
@@ -136,6 +147,16 @@ static void hgTask(void*) {
 
 static void hgStart() {
   hgStarted = true;
+  if (hgRtcHandshake == HG_HANDSHAKE_MAGIC) {
+    // Restarted in the middle of a handshake: back off 5, 10, 20… up to 60 minutes.
+    hgStrikes = (hgRtcStrikes < 12) ? hgRtcStrikes + 1 : 12;
+    uint32_t mins = 5UL << (hgStrikes - 1 < 4 ? hgStrikes - 1 : 4);
+    if (mins > 60) mins = 60;
+    hgHoldUntil = millis() + mins * 60000UL;
+    hgLastErr = -20;
+  } else hgStrikes = 0;
+  hgRtcStrikes = hgStrikes;
+  hgRtcHandshake = 0;
   hgTcp = new WiFiClient();
   hgTls = new ESP_SSLClient();
   hgTls->setClient(hgTcp);
@@ -157,7 +178,7 @@ static void hgStart() {
   hgMqtt->setBufferSize(HG_CLOUD_MAXCMD + 128);
   hgMqtt->setKeepAlive(60);
   hgMqtt->setSocketTimeout(10);
-  if (xTaskCreatePinnedToCore(hgTask, "hgCloud", 10240, nullptr, 1, nullptr, 0) != pdPASS) hgLastErr = -3;
+  if (xTaskCreatePinnedToCore(hgTask, "hgCloud", 10240, nullptr, tskIDLE_PRIORITY, nullptr, 0) != pdPASS) hgLastErr = -3;
 }
 
 // Keeps only everyday light control; everything else stays home-network only.
@@ -240,6 +261,7 @@ void hgCloudInfo(JsonObject root) {
   c[F("cmds")] = hgCmds;
   c[F("rejected")] = hgRejected;
   c[F("err")] = hgLastErr;
+  if (hgStrikes) { c[F("strikes")] = hgStrikes; c[F("holdSec")] = (int32_t)(hgHoldUntil - millis()) > 0 ? (hgHoldUntil - millis()) / 1000 : 0; }
   c[F("heapBefore")] = hgHeapBefore;       // free memory just before the encrypted connection started
   c[F("heapConnected")] = hgHeapConnected; // free memory right after it connected
 }
