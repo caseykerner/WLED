@@ -37,7 +37,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION   "0.2.0"
+#define BRIDGE_VERSION   "0.2.1"
 #define TUN_PART         48000
 #define TUN_MAX_BODY     (200 * 1024)
 #define CLOUD_FILE       "/cloud.json"
@@ -81,6 +81,11 @@ struct TunReq {
 static std::vector<TunReq> tunIn;        // still collecting parts
 static std::vector<TunReq> tunReady;     // complete, waiting to run
 static uint32_t tunDone = 0, tunRefused = 0;
+static std::vector<String> tunRefusedLog;   // last few refused requests, for the status page
+static void noteRefused(const String& what) {
+  tunRefusedLog.push_back(what);
+  if (tunRefusedLog.size() > 12) tunRefusedLog.erase(tunRefusedLog.begin());
+}
 
 static void led(uint8_t r, uint8_t g, uint8_t b) { neopixelWrite(LED_PIN, r, g, b); }
 
@@ -326,8 +331,8 @@ static void tunReply(const TunReq& r, int status, const String& ct, const std::s
 
 static void tunRun(TunReq& r) {
   Controller* c = byLogin(r.login);
-  if (r.bad || !c || c->ip.isEmpty()) { tunRefused++; tunReply(r, r.bad ? 413 : 404, "", ""); return; }
-  if (!tunAllowed(r)) { tunRefused++; tunReply(r, 403, "", ""); return; }
+  if (r.bad || !c || c->ip.isEmpty()) { tunRefused++; noteRefused(r.method + " " + r.login + r.path + (r.bad ? " (parts)" : " (unknown controller)")); tunReply(r, r.bad ? 413 : 404, "", ""); return; }
+  if (!tunAllowed(r)) { tunRefused++; noteRefused(r.method + " " + r.login + r.path); tunReply(r, 403, "", ""); return; }
   HTTPClient http;
   http.setTimeout(r.body.size() > 20000 ? 30000 : 6000);
   http.setConnectTimeout(3000);
@@ -417,6 +422,8 @@ static void webStatusJson() {
   d["connects"] = connects; d["in"] = cmdsIn; d["sent"] = cmdsSent; d["refused"] = cmdsRefused;
   d["heap"] = ESP.getFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
   d["tunnel"] = tunDone; d["tunnelRefused"] = tunRefused;
+  JsonArray rl = d["refusedLog"].to<JsonArray>();
+  for (auto& x : tunRefusedLog) rl.add(x);
   JsonArray a = d["controllers"].to<JsonArray>();
   for (auto& c : ctrls) {
     JsonObject o = a.add<JsonObject>();
