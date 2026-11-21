@@ -37,7 +37,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION   "0.2.1"
+#define BRIDGE_VERSION   "0.2.2"
 #define TUN_PART         48000
 #define TUN_MAX_BODY     (200 * 1024)
 #define CLOUD_FILE       "/cloud.json"
@@ -276,8 +276,10 @@ static bool tunAllowed(TunReq& r) {
   String p = r.path, bare = p;
   int q = bare.indexOf('?'); if (q >= 0) bare = bare.substring(0, q);
   String lower = p; lower.toLowerCase();
-  if (lower.indexOf("sec") >= 0 || lower.indexOf("update") >= 0 || lower.indexOf("reset") >= 0 ||
-      lower.indexOf("settings") >= 0 || lower.indexOf("..") >= 0) return false;
+  // Whole page names, not words inside them ("presets" contains "reset").
+  String bl = bare; bl.toLowerCase();
+  if (bl.startsWith("/update") || bl.startsWith("/reset") || bl.startsWith("/settings") || bl.startsWith("/upload/") ||
+      bl.indexOf("wsec") >= 0 || bl.endsWith("sec.json") || lower.indexOf("..") >= 0) return false;
   if (r.method == "GET") {
     if (bare.startsWith("/json")) return true;
     if (bare.endsWith(".json") && lower.indexOf("cfg") < 0) return true;
