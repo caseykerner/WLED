@@ -37,6 +37,7 @@
 #include <mbedtls/base64.h>
 #include <LittleFS.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
 #include <atomic>
 #include <memory>
 #include <vector>
@@ -52,7 +53,7 @@ static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.8.0"
+#define BRIDGE_VERSION    "0.8.1"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -903,6 +904,8 @@ static void connectCloud() {
   lastTry = millis();
   led(0, 40, 40);
   mqtt.setServer(cloudEndpoint.c_str(), 8883);
+  tls.setHandshakeTimeout(20);             // seconds (default 120): a stalled handshake mustn't freeze the hub
+  uint32_t t0 = millis();
   if (mqtt.connect(cloudId.c_str(), stateTopicSelf.c_str(), 1, true, "{\"online\":false}")) {
     connects++; lastMqttErr = 0;
     mqtt.subscribe("hg/+/cmd", 1);
@@ -912,11 +915,12 @@ static void connectCloud() {
     mqtt.publish(stateTopicSelf.c_str(), s.c_str(), true);
     for (int i = 0; i < nCtrls; i++) { ctrls[i].pollSoon = true; ctrls[i].stateHash = 0; }
     led(0, 12, 0);
-    Serial.println("[cloud] connected");
+    Serial.printf("[cloud] connected in %u ms\n", (unsigned)(millis() - t0));
   } else {
     lastMqttErr = mqtt.state();
     led(40, 0, 0);
-    Serial.printf("[cloud] failed (%d)\n", lastMqttErr);
+    char why[96] = ""; tls.lastError(why, sizeof why);
+    Serial.printf("[cloud] failed (%d) after %u ms: %s\n", lastMqttErr, (unsigned)(millis() - t0), why);
   }
 }
 
@@ -1095,6 +1099,14 @@ static uint32_t bleOffAt = 0;             // when "done" was asked for, or 0
 static NimBLECharacteristic* bleEvt = nullptr;
 static QueueHandle_t bleQ;                // commands from the Bluetooth task to hgSetup
 static volatile bool bleConnected = false;
+// The Wi-Fi network saved on the hub (by Bluetooth setup). WiFi.SSID() only answers while connected,
+// so it can't be used to tell "nothing saved" from "saved but not joined yet".
+static String savedSsid() {
+  wifi_config_t conf;
+  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return String();
+  char b[33]; memcpy(b, conf.sta.ssid, 32); b[32] = 0;
+  return String(b);
+}
 static uint32_t wifiLostSince = 0;        // millis() since the saved Wi-Fi stopped working (0 = fine)
 static bool mdnsUp = false;
 static bool bleDismissed = false;         // the app said "done": stay off until the Wi-Fi breaks or the hub restarts
@@ -1278,7 +1290,7 @@ static void setupTask(void*) {
 
 // Called from loop(): Bluetooth on while setup is allowed or the Wi-Fi isn't working, off otherwise.
 static void bleManage() {
-  bool noWifi = WiFi.SSID().isEmpty() || (wifiLostSince && millis() - wifiLostSince > 60000);
+  bool noWifi = savedSsid().isEmpty() || (wifiLostSince && millis() - wifiLostSince > 60000);
   bool want = (setupAllowed() && !bleDismissed) || noWifi;
   if (bleOffAt && (int32_t)(millis() - bleOffAt) > 0 && !noWifi) { bleStop(); return; }
   if (want && !bleOn && (!bleDismissed || noWifi)) bleStart();
@@ -1327,7 +1339,8 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
   led(40, 30, 0);
-  if (!WiFi.SSID().isEmpty()) WiFi.begin();
+  if (!savedSsid().isEmpty()) { Serial.println("[wifi] joining " + savedSsid()); WiFi.begin(); }
+  else Serial.println("[wifi] nothing saved: waiting for Bluetooth setup");
 
   // The bridge checks the cloud's certificate against Amazon Root CA 1 only, and logs in with its own.
   if (provisioned) {
@@ -1364,7 +1377,7 @@ void loop() {
     if (!wifiLostSince) wifiLostSince = millis() | 1;
     // A saved network that's gone quiet: ask again now and then (setAutoReconnect covers most cases).
     static uint32_t lastJoin = 0;
-    if (!WiFi.SSID().isEmpty() && millis() - lastJoin > 30000 && millis() - wifiLostSince > 30000) { lastJoin = millis(); WiFi.reconnect(); }
+    if (!savedSsid().isEmpty() && millis() - lastJoin > 30000 && millis() - wifiLostSince > 30000) { lastJoin = millis(); WiFi.begin(); }
     if (bleOn) led(0, 25, 40); else led(40, 30, 0);       // cyan: waiting for Bluetooth setup; amber: no Wi-Fi
     delay(50); return;
   }
