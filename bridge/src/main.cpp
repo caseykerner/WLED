@@ -66,7 +66,7 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.12.0"
+#define BRIDGE_VERSION    "0.12.1"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -614,6 +614,7 @@ static SemaphoreHandle_t goveeMx;    // guards the list and the sending socket
 static WiFiUDP goveeIn, goveeOut;
 static bool goveeListening = false;
 static uint32_t goveeScanAt = 0;
+static volatile bool goveeAskTwice = false;
 static volatile uint32_t goveeAskAt = 0;   // millis(): ask every light for its status then (after an order)
 
 // One message to a light (or the search address). Caller holds goveeMx.
@@ -678,7 +679,10 @@ static void goveePoll() {
   }
   // Status: every 15 s for each light, and shortly after an order.
   bool askAll = goveeAskAt && (int32_t)(now - goveeAskAt) >= 0;
-  if (askAll) goveeAskAt = 0;
+  if (askAll) {                      // and once more a little later: a light's status trails its orders
+    goveeAskAt = 0;
+    if (goveeAskTwice) { goveeAskTwice = false; uint32_t t = now + 1500; goveeAskAt = t ? t : 1; }
+  }
   xSemaphoreTake(goveeMx, portMAX_DELAY);
   for (int i = 0; i < nGovee; i++) {
     Govee& g = govees[i];
@@ -700,20 +704,25 @@ static bool goveeOrder(JsonObjectConst o) {
     Govee& g = govees[i];
     IPAddress ip;
     if (g.id != id || !ip.fromString(g.ip)) continue;
-    if (o["on"].is<bool>()) goveeSend(ip, 4003, "turn", o["on"].as<bool>() ? "{\"value\":1}" : "{\"value\":0}");
+    // A light drops orders that arrive right behind one another (seen on an H612F: the third of
+    // three sent together was lost), so they go out 200 ms apart.
+    bool first = true;
+    auto gap = [&first]() { if (!first) delay(200); first = false; };
+    if (o["on"].is<bool>()) { gap(); goveeSend(ip, 4003, "turn", o["on"].as<bool>() ? "{\"value\":1}" : "{\"value\":0}"); }
     if (o["bri"].is<int>()) {
       int v = constrain((int)o["bri"], 1, 100);
-      goveeSend(ip, 4003, "brightness", (String("{\"value\":") + v + "}").c_str());
+      gap(); goveeSend(ip, 4003, "brightness", (String("{\"value\":") + v + "}").c_str());
     }
     JsonArrayConst c = o["col"];
     if (c.size() == 3) {
+      gap();
       String d = String("{\"color\":{\"r\":") + constrain((int)c[0], 0, 255) + ",\"g\":" + constrain((int)c[1], 0, 255) + ",\"b\":" + constrain((int)c[2], 0, 255) + "},\"colorTemInKelvin\":0}";
       goveeSend(ip, 4003, "colorwc", d.c_str());
     }
     sent = true;
   }
   xSemaphoreGive(goveeMx);
-  if (sent) { uint32_t t = millis() + 500; goveeAskAt = t ? t : 1; }
+  if (sent) { uint32_t t = millis() + 700; goveeAskAt = t ? t : 1; goveeAskTwice = true; }
   return sent;
 }
 
