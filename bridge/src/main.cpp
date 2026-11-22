@@ -65,10 +65,11 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.10.1"
+#define BRIDGE_VERSION    "0.11.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
+#define SUPPORT_FILE      "/support.json"
 #define LED_PIN           48
 #define MAX_CTRLS         16
 #define WORKERS           4
@@ -157,6 +158,24 @@ static void sendLocked() {
   web.send(403, "text/plain", "locked: tap Allow updates on the Hub page in the HomeGlow app, or unplug the hub and plug it back in");
 }
 
+// ---------- support access (0.11) ----------
+// The owner can let HomeGlow support look at this home for a while ("Allow HomeGlow support" on the
+// Hub page; sent through AWS with the owner's login). While it's on, the hub copies what it
+// publishes about itself and its controllers to hg/<home>/sup/…, the only part of a home the support
+// login can read, and takes a few support orders on hg/<home>/sup/cmd (restart, look again for
+// controllers, read the log, update the hub's software). Every order must carry the token from the
+// support code the owner passes on (<home>-<token>). When the time is up, or the owner ends it, the
+// copies are erased and orders are ignored again. Kept through a restart in /support.json.
+static String supportToken;                       // guarded by ctrlMx
+static volatile bool supportActive = false;
+static uint32_t supportUntil = 0;                 // millis()
+static uint32_t supportSaved = 0;
+static volatile uint32_t restartAt = 0;           // millis(); set by a support restart order
+static volatile bool updating = false;            // a software update is being written: no polling meanwhile
+static std::atomic<uint32_t> supportOrders{0};
+static bool supportOn() { return supportActive && (int32_t)(supportUntil - millis()) > 0; }
+static uint32_t supportLeft() { return supportOn() ? (supportUntil - millis()) / 1000 : 0; }
+
 // Internal memory (not PSRAM) is what runs out first: the AWS connection, Wi-Fi and the tasks all
 // need it. Below ~30 KB a reconnect can fail, so the Hub page warns well before that.
 static bool lowMemory() {
@@ -202,6 +221,26 @@ static void noteRefused(const String& what) {
 }
 
 static void led(uint8_t r, uint8_t g, uint8_t b) { neopixelWrite(LED_PIN, r, g, b); }
+
+static void saveSupport() {
+  supportSaved = millis();
+  if (!supportOn()) { LittleFS.remove(SUPPORT_FILE); return; }
+  JsonDocument d;
+  xSemaphoreTake(ctrlMx, portMAX_DELAY); d["t"] = supportToken; xSemaphoreGive(ctrlMx);
+  d["left"] = supportLeft();
+  File f = LittleFS.open(SUPPORT_FILE, "w");
+  if (f) { serializeJson(d, f); f.close(); }
+}
+static void loadSupport() {
+  File f = LittleFS.open(SUPPORT_FILE, "r");
+  if (!f) return;
+  JsonDocument d;
+  DeserializationError e = deserializeJson(d, f); f.close();
+  uint32_t left = d["left"] | 0;
+  String t = d["t"] | "";
+  if (e || !left || t.isEmpty() || left > 7UL * 86400) return;
+  supportToken = t; supportUntil = millis() + left * 1000UL; supportActive = true;
+}
 
 // Big JSON documents (a batch of looks) go in PSRAM: plain malloc only uses internal memory here.
 struct SpiRamAllocator : ArduinoJson::Allocator {
@@ -547,6 +586,37 @@ static void poll(int i) {
   if (!was) { Serial.printf("[poll] %s online\n", login.c_str()); hubEvent(c.name + " is online"); }
 }
 
+// Support access on (for `seconds`) or off (0). On: a new token, and everything is published again so
+// the copies under sup/ exist at once. Off: the copies are erased (empty retained messages).
+static void setSupport(uint32_t seconds) {
+  if (!cloudHome.length()) return;
+  bool was = supportOn();
+  if (seconds) {
+    static const char a[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+    String t; for (int i = 0; i < 4; i++) t += a[esp_random() % (sizeof a - 1)];
+    xSemaphoreTake(ctrlMx, portMAX_DELAY);
+    if (!was || supportToken.isEmpty()) supportToken = t;         // extending keeps the code already passed on
+    xSemaphoreGive(ctrlMx);
+    supportUntil = millis() + seconds * 1000UL; supportActive = true;
+    for (int i = 0; i < nCtrls; i++) { ctrls[i].stateHash = 0; ctrls[i].lastFull = 0; ctrls[i].lastSmall = 0; ctrls[i].pollSoon = true; }
+    hubEvent(seconds >= 172800 ? String("HomeGlow support allowed for ") + seconds / 86400 + " days"
+                               : String("HomeGlow support allowed for ") + (seconds + 1800) / 3600 + " hours");
+  } else {
+    supportActive = false;
+    std::vector<String> logins;
+    xSemaphoreTake(ctrlMx, portMAX_DELAY);
+    supportToken = "";
+    for (int i = 0; i < nCtrls; i++) logins.push_back(ctrls[i].login);
+    xSemaphoreGive(ctrlMx);
+    auto wipe = [](const String& t) { Out* o = new Out; o->topic = t.c_str(); o->retained = true; post(o); };
+    wipe(tb + "sup/" + hubKey + "/full");
+    for (auto& l : logins) { wipe(tb + "sup/" + l + "/full"); wipe(tb + "sup/" + l + "/state"); }
+    if (was) hubEvent("HomeGlow support access ended");
+  }
+  saveSupport();
+  statsDirty = true;
+}
+
 // The hub's page in the app: hub health, what it's doing, and each controller's check, published
 // (retained) on hg/<hub>/full every 30 s and soon after anything happens.
 static uint32_t lastStats = 0;
@@ -563,6 +633,8 @@ static void publishStats() {
   static bool wasLow = false;
   if (low != wasLow) { wasLow = low; hubEvent(low ? "Memory is running low" : "Memory back to normal"); }
   d["updates"] = setupAllowed();
+  d["support"] = supportLeft();
+  if (supportOn()) { xSemaphoreTake(ctrlMx, portMAX_DELAY); String t = supportToken; xSemaphoreGive(ctrlMx); d["supportCode"] = cloudHome + "-" + t; }
   d["connects"] = (uint32_t)connects; d["plays"] = (uint32_t)playsDone; d["resends"] = (uint32_t)resendsDone;
   uint32_t n = tunDone; d["requests"] = n; d["avgMs"] = n ? (uint32_t)(tunMsTotal / n) : 0;
   JsonArray cs = d["controllers"].to<JsonArray>();
@@ -595,6 +667,9 @@ static void statusTask(void*) {
       uint32_t scanEvery = millis() < 600000UL ? 60000UL : SCAN_EVERY_MS;
       if (millis() - lastScan > scanEvery || nCtrls == 0) scan();
       if (knownDirty) { knownDirty = false; saveKnown(); }
+      if (supportActive && !supportOn()) setSupport(0);                               // time's up
+      else if (supportActive && millis() - supportSaved > 600000UL) saveSupport();    // so a restart doesn't add time
+      if (updating) { delay(200); continue; }
       // Asked-for checks (after a change) first, then whatever is due.
       int pick = -1;
       for (int i = 0; i < nCtrls && pick < 0; i++) if (ctrls[i].owned && ctrls[i].pollSoon) pick = i;
@@ -709,6 +784,19 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
     post(o);
     return nullptr;
   }
+  // The owner's "Allow HomeGlow support" (only through AWS): {"support":<seconds>}, 0 ends it.
+  if (h["support"].is<int>() && !(h["local"] | false)) {
+    long secs = h["support"] | 0;
+    if (secs < 0) secs = 0;
+    if (secs > 7L * 86400) secs = 7L * 86400;
+    setSupport((uint32_t)secs);
+    xSemaphoreTake(ctrlMx, portMAX_DELAY); String t = supportToken; xSemaphoreGive(ctrlMx);
+    Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + String((const char*)(h["c"] | ""))).c_str();
+    o->id = (const char*)(h["id"] | ""); o->status = cloudHome.length() ? 200 : 501; o->ct = "application/json";
+    o->payload = "{\"support\":" + std::to_string(supportLeft()) + ",\"code\":\"" + std::string(supportOn() ? (cloudHome + "-" + t).c_str() : "") + "\"}";
+    post(o);
+    return nullptr;
+  }
   // Controllers the app already knows (only through AWS): {"meet":[{"mac","ip","name"},…]}. Asking
   // the network who is there (scan) misses some controllers each time and all that are powered
   // off; the app has had every one of them on its list since the day it was added.
@@ -819,6 +907,119 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
   return b;
 }
 
+// Downloads new hub software from HomeGlow's own repository and installs it. The address must be in
+// that repository and the file must match `sha` (SHA-256, hex) from the order. The order arrives
+// over the hub's authenticated AWS connection, so a file that matches it is the one that was meant,
+// whatever the download passed through; that is why the download itself isn't certificate-checked.
+// Returns "" once installed (the caller restarts the hub), else what went wrong.
+static String selfUpdate(const String& url, const String& sha) {
+  if (!url.startsWith("https://raw.githubusercontent.com/caseykerner/WLED/")) return "address not allowed";
+  if (sha.length() != 64) return "no checksum";
+  if (Update.isRunning() || updating) return "an update is already running";
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(20);
+  HTTPClient http;
+  http.setReuse(false); http.setConnectTimeout(8000); http.setTimeout(8000);
+  if (!http.begin(client, url)) return "bad address";
+  int code = http.GET();
+  if (code != 200) { http.end(); return String("download failed (") + code + ")"; }
+  int size = http.getSize();
+  if (size < 200000 || size > 3000000) { http.end(); return "unexpected file size"; }
+  uint8_t* buf = (uint8_t*)ps_malloc(4096);
+  if (!buf) { http.end(); return "out of memory"; }
+  if (!Update.begin(size)) { free(buf); http.end(); return "no room for the update"; }
+  updating = true;
+  mbedtls_sha256_context sh; mbedtls_sha256_init(&sh); mbedtls_sha256_starts_ret(&sh, 0);
+  WiFiClient* in = http.getStreamPtr();
+  int got = 0; uint32_t quiet = millis(); String err;
+  while (got < size) {
+    int n = in->available() ? in->read(buf, std::min(4096, size - got)) : 0;
+    if (n > 0) {
+      mbedtls_sha256_update_ret(&sh, buf, n);
+      if ((int)Update.write(buf, n) != n) { err = "couldn't write the update"; break; }
+      got += n; quiet = millis();
+    } else {
+      if (!in->connected() && !in->available()) { err = "download cut off"; break; }
+      if (millis() - quiet > 15000) { err = "download stalled"; break; }
+      delay(5);
+    }
+  }
+  free(buf); http.end();
+  uint8_t dig[32]; mbedtls_sha256_finish_ret(&sh, dig); mbedtls_sha256_free(&sh);
+  char hex[65]; for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
+  if (err.isEmpty() && !sha.equalsIgnoreCase(hex)) err = "the file doesn't match its checksum";
+  if (err.length()) { Update.abort(); updating = false; return err; }
+  if (!Update.end(true)) { updating = false; return "couldn't finish the update"; }
+  return "";
+}
+
+// An order from HomeGlow support (hg/<home>/sup/cmd), only while the owner allows support and only
+// with the token from the support code:
+//   {"t":token,"id":…,"c":<support client>,"op":"ping"|"log"|"rescan"|"restart"|"reboot"|"info"|"update",
+//    "login":<controller, for reboot/info>,"url":…,"sha":… (update)}
+// Answered on hg/<home>/sup/resp/<c>. Without a valid token there is no answer at all.
+static void onSupportCommand(const uint8_t* payload, size_t len) {
+  JsonDocument h;
+  if (deserializeJson(h, (const char*)payload, len)) return;
+  xSemaphoreTake(ctrlMx, portMAX_DELAY); String token = supportToken; xSemaphoreGive(ctrlMx);
+  String got = h["t"] | "";
+  if (!supportOn() || token.isEmpty() || !got.equalsIgnoreCase(token)) { cmdsRefused++; return; }
+  supportOrders++;
+  String op = h["op"] | "", login = h["login"] | "";
+  Out* o = new Out; o->tunnel = true; o->topic = (tb + "sup/resp/" + String((const char*)(h["c"] | ""))).c_str();
+  o->id = (const char*)(h["id"] | ""); o->status = 200; o->ct = "application/json"; o->payload = "{\"ok\":true}";
+  if (op == "ping") {
+  } else if (op == "log") {
+    String out = "== hub events (seconds ago) ==\n";
+    uint32_t now = millis();
+    xSemaphoreTake(ctrlMx, portMAX_DELAY);
+    for (int i = (int)hubEvents.size() - 1; i >= 0; i--) { out += String((now - hubEvents[i].at) / 1000) + "s  " + hubEvents[i].text + "\n"; }
+    out += "\n== refused requests ==\n";
+    for (auto& x : tunRefusedLog) { out += x; out += '\n'; }
+    out += "\n== hub requests ==\n";
+    for (auto& x : tunRecent) { out += x; out += '\n'; }
+    out += "\n== app timeline (hub uptime s | app s since launch) ==\n";
+    for (auto& x : appLog) { out += x; out += '\n'; }
+    xSemaphoreGive(ctrlMx);
+    o->ct = "text/plain"; o->payload = out.c_str();
+  } else if (op == "rescan") {
+    lastScan = millis() - 3600000UL;
+    hubEvent("HomeGlow support asked the hub to look for controllers");
+  } else if (op == "restart") {
+    hubEvent("Restarted by HomeGlow support");
+    saveSupport();
+    restartAt = millis() + 2500; if (!restartAt) restartAt = 1;
+  } else if (op == "reboot" || op == "info") {
+    String ip;
+    int idx = findCtrl(login, ip);
+    if (idx < 0 || ip.isEmpty()) { o->status = 404; o->payload = "{\"error\":\"unknown controller\"}"; }
+    else if (xSemaphoreTake(ctrls[idx].lock, pdMS_TO_TICKS(15000)) != pdTRUE) { o->status = 503; o->payload = "{\"error\":\"controller busy\"}"; }
+    else {
+      std::string out;
+      int code = op == "info" ? wledRequest(ip, "GET", "/json/info", "", "", out, nullptr, 3000, 6000)
+                              : wledRequest(ip, "POST", "/json/state", "{\"rb\":true}", "application/json", out, nullptr, 3000, 6000);
+      xSemaphoreGive(ctrls[idx].lock);
+      o->status = code > 0 ? code : 504;
+      if (op == "info" && code == 200) o->payload = out;
+      if (op == "reboot") { hubEvent(ctrls[idx].name + " restarted by HomeGlow support"); ctrls[idx].pollSoon = true; }
+    }
+  } else if (op == "update") {
+    hubEvent("HomeGlow support is updating the hub's software");
+    String err = selfUpdate(h["url"] | "", h["sha"] | "");
+    if (err.length()) {
+      hubEvent("Software update failed: " + err);
+      JsonDocument e; e["error"] = err; o->status = 500; o->payload.clear(); serializeJson(e, o->payload);
+    } else {
+      hubEvent("Software updated by HomeGlow support");
+      o->payload = "{\"installed\":true}";
+      saveSupport();
+      restartAt = millis() + 4000; if (!restartAt) restartAt = 1;
+    }
+  } else { o->status = 400; o->payload = "{\"error\":\"unknown order\"}"; }
+  post(o);
+}
+
 // Hub commands are unpacked in their own task: inflating a batch needs far more stack than the
 // main loop's 8 KB (0.4.0 crashed in the decompressor on a real 4-controller look).
 static QueueHandle_t hubQ;
@@ -826,7 +1027,8 @@ static void hubTask(void*) {
   for (;;) {
     std::string* m = nullptr;
     if (xQueueReceive(hubQ, &m, portMAX_DELAY) != pdTRUE || !m) continue;
-    onHubCommand((uint8_t*)m->data(), m->size());
+    if (!m->empty() && (*m)[0] == '\x01') onSupportCommand((const uint8_t*)m->data() + 1, m->size() - 1);   // marked in onMessage
+    else onHubCommand((uint8_t*)m->data(), m->size());
     delete m;
   }
 }
@@ -839,15 +1041,23 @@ static void onMessage(char* topic, uint8_t* payload, unsigned int len) {
   String t(topic);
   if (t.startsWith(tb + "req/")) { onTunnel(t.substring(tb.length() + 4), payload, len); return; }
   if (hubKey.length() && t == tb + hubKey + "/cmd") { queueHubCommand(payload, len); return; }
+  if (cloudHome.length() && t == tb + "sup/cmd") {      // HomeGlow support: handled in the hub task
+    if (!supportOn() || len == 0 || len > MAX_CMD) { cmdsRefused++; return; }
+    std::string* m = new std::string(1, '\x01'); m->append((const char*)payload, len);
+    if (xQueueSend(hubQ, &m, 0) != pdTRUE) { delete m; cmdsRefused++; }
+    return;
+  }
   if (t == tb + "applog/cmd") {                // the app's diagnostics timeline, for /log
     String all((const char*)payload, len);
     int from = 0;
+    xSemaphoreTake(ctrlMx, portMAX_DELAY);       // support's log order reads it from the hub task
     while (from < (int)all.length()) {
       int nl = all.indexOf('\n', from); if (nl < 0) nl = all.length();
       appLog.push_back(String(millis() / 1000) + " | " + all.substring(from, nl));
       from = nl + 1;
     }
     while (appLog.size() > 400) appLog.erase(appLog.begin());
+    xSemaphoreGive(ctrlMx);
     return;
   }
   cmdsIn++;
@@ -1049,6 +1259,13 @@ static void publishOut(const Out& o) {
   if (!writeAll((const uint8_t*)o.payload.data(), o.payload.size())) return;
   mqtt.endPublish();
   published++;
+  // Support access: a copy of everything about the hub and its controllers under hg/<home>/sup/….
+  if (supportOn() && o.topic.compare(0, tb.length(), tb.c_str()) == 0 && o.topic.compare(tb.length(), 4, "sup/") != 0) {
+    std::string copy = std::string(tb.c_str()) + "sup/" + o.topic.substr(tb.length());
+    if (!mqtt.beginPublish(copy.c_str(), o.payload.size(), o.retained)) return;
+    if (!writeAll((const uint8_t*)o.payload.data(), o.payload.size())) return;
+    mqtt.endPublish();
+  }
 }
 
 static void connectCloud() {
@@ -1062,6 +1279,7 @@ static void connectCloud() {
     if (cloudHome.length()) {
       mqtt.subscribe((tb + "hub/cmd").c_str(), 1);
       mqtt.subscribe((tb + "applog/cmd").c_str(), 0);
+      mqtt.subscribe((tb + "sup/cmd").c_str(), 1);
     } else {
       mqtt.subscribe("hg/+/cmd", 1);
     }
@@ -1114,21 +1332,24 @@ static void webUpdateChunk() {
   if (u.status == UPLOAD_FILE_START) {
     updateRefused = !setupAllowed();
     if (updateRefused) return;
+    if (Update.isRunning()) Update.abort();      // an earlier upload that was cut off: start clean
     hubEvent("Installing a software update");
+    updating = true;                             // the status task stops asking controllers meanwhile
     Update.begin(UPDATE_SIZE_UNKNOWN);
   }
   if (updateRefused) return;
   else if (u.status == UPLOAD_FILE_WRITE) Update.write(u.buf, u.currentSize);
-  else if (u.status == UPLOAD_FILE_END) Update.end(true);
+  else if (u.status == UPLOAD_FILE_END) { Update.end(true); updating = false; }
+  else if (u.status == UPLOAD_FILE_ABORTED) { Update.abort(); updating = false; hubEvent("The software update was cut off"); }
 }
 
 
 // Plain-text timeline: the app's lines (hub seconds | app seconds since launch) and the hub's requests.
 static void webLog() {
   String out = "== app timeline (hub uptime s | app s since launch) ==\n";
+  xSemaphoreTake(ctrlMx, portMAX_DELAY);
   for (auto& x : appLog) { out += x; out += '\n'; }
   out += "\n== hub requests ==\n";
-  xSemaphoreTake(ctrlMx, portMAX_DELAY);
   for (auto& x : tunRecent) { out += x; out += '\n'; }
   xSemaphoreGive(ctrlMx);
   web.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1521,6 +1742,7 @@ void setup() {
   provisioned = loadCloud();
   loadOwned();
   loadKnown();
+  if (cloudHome.length()) loadSupport();
   stateTopicSelf = tb + (hubKey.length() ? hubKey : String("bridge")) + "/state";
   ctrlMx = xSemaphoreCreateMutex();
   jobQ = xQueueCreate(32, sizeof(Job*));
@@ -1571,6 +1793,7 @@ void setup() {
 
 void loop() {
   web.handleClient();
+  if (restartAt && (int32_t)(millis() - restartAt) > 0) { delay(200); ESP.restart(); }
   static uint32_t lastBle = 0;
   if (millis() - lastBle > 1000) { lastBle = millis(); bleManage(); }
   if (WiFi.status() != WL_CONNECTED) {
