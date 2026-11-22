@@ -66,7 +66,7 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.12.3"
+#define BRIDGE_VERSION    "0.13.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -601,11 +601,25 @@ static void poll(int i) {
 //   status:  devStatus {} to <light>:4003, answered to port 4002 (onOff, brightness, color)
 // Only whole-light on/off, brightness and color: Govee's scenes and per-segment colors aren't in
 // this API. The hub lists the lights it finds in its status ("govee") and takes orders for them.
+// A look the hub plays on a Govee light by sending it colors for each of its sections about 20
+// times a second ("razer" messages, the same way Govee's desktop app does it). Stops when the light
+// is given a plain color or switched off.
+#define GOVEE_MAX_SECTIONS 60
+#define GOVEE_MAX_COLORS 6
+struct GoveeLook {
+  String name;                       // "" = none; flow, chase, twinkle, breathe, blocks
+  uint8_t speed = 50;                // 1-100
+  uint8_t n = 10;                    // sections along the light (each a group of LEDs that share a color)
+  uint8_t nc = 0;                    // colors
+  uint8_t col[GOVEE_MAX_COLORS][3] = {};
+  uint32_t started = 0, enabledAt = 0;
+};
 struct Govee {
   String id, sku, ip;
   bool on = false;
   uint8_t bri = 0, r = 0, g = 0, b = 0;
   uint32_t seen = 0, asked = 0;      // millis()
+  GoveeLook look;
 };
 #define MAX_GOVEE 16
 static Govee govees[MAX_GOVEE];
@@ -619,12 +633,36 @@ static volatile bool goveeDirty = false;       // the list changed: save it
 static std::atomic<uint32_t> goveeTx{0}, goveeRx{0};
 #define GOVEE_FILE "/govee.json"
 
+// Takes a look from {"name","speed","colors":[[r,g,b],…],"n"} ("name":"off" or nothing = none).
+static void goveeSetLook(Govee& g, JsonObjectConst fx) {
+  String name = fx["name"] | "";
+  if (fx["n"].is<int>()) g.look.n = constrain((int)fx["n"], 1, GOVEE_MAX_SECTIONS);
+  if (name != "flow" && name != "chase" && name != "twinkle" && name != "breathe" && name != "blocks") { g.look.name = ""; return; }
+  g.look.speed = constrain((int)(fx["speed"] | 50), 1, 100);
+  g.look.nc = 0;
+  for (JsonArrayConst c : fx["colors"].as<JsonArrayConst>()) {
+    if (g.look.nc >= GOVEE_MAX_COLORS || c.size() != 3) break;
+    for (int k = 0; k < 3; k++) g.look.col[g.look.nc][k] = constrain((int)c[k], 0, 255);
+    g.look.nc++;
+  }
+  if (!g.look.nc) { g.look.col[0][0] = 255; g.look.col[0][1] = 255; g.look.col[0][2] = 255; g.look.nc = 1; }
+  g.look.name = name; g.look.started = millis(); g.look.enabledAt = 0;
+}
+
 // The lights found so far are kept (/govee.json), so after a restart they can be asked directly
 // instead of waiting for the search to reach them: a search message is easily missed over Wi-Fi.
 static void saveGovee() {
   JsonDocument d; JsonArray a = d.to<JsonArray>();
   xSemaphoreTake(goveeMx, portMAX_DELAY);
-  for (int i = 0; i < nGovee; i++) { JsonObject o = a.add<JsonObject>(); o["id"] = govees[i].id; o["sku"] = govees[i].sku; o["ip"] = govees[i].ip; }
+  for (int i = 0; i < nGovee; i++) {
+    Govee& g = govees[i];
+    JsonObject o = a.add<JsonObject>(); o["id"] = g.id; o["sku"] = g.sku; o["ip"] = g.ip; o["n"] = g.look.n;
+    if (g.look.name.length()) {      // a playing look is kept, so it carries on after a restart
+      JsonObject fx = o["fx"].to<JsonObject>(); fx["name"] = g.look.name; fx["speed"] = g.look.speed;
+      JsonArray cs = fx["colors"].to<JsonArray>();
+      for (int c = 0; c < g.look.nc; c++) { JsonArray one = cs.add<JsonArray>(); one.add(g.look.col[c][0]); one.add(g.look.col[c][1]); one.add(g.look.col[c][2]); }
+    }
+  }
   xSemaphoreGive(goveeMx);
   File f = LittleFS.open(GOVEE_FILE, "w");
   if (f) { serializeJson(d, f); f.close(); }
@@ -639,6 +677,8 @@ static void loadGovee() {
     if (nGovee >= MAX_GOVEE) break;
     Govee& g = govees[nGovee]; g = Govee();
     g.id = (const char*)(o["id"] | ""); g.sku = (const char*)(o["sku"] | ""); g.ip = (const char*)(o["ip"] | "");
+    g.look.n = constrain((int)(o["n"] | 10), 1, GOVEE_MAX_SECTIONS);
+    goveeSetLook(g, o["fx"]);
     if (g.id.length() && g.ip.length()) nGovee++;
   }
 }
@@ -650,6 +690,87 @@ static void goveeSend(const IPAddress& to, uint16_t port, const char* cmd, const
   if (!goveeOut.beginPacket(to, port)) return;
   goveeOut.write((const uint8_t*)m.c_str(), m.length());
   if (goveeOut.endPacket()) goveeTx++;
+}
+
+
+// One frame of a look: a color for each section at time t (ms since the look started).
+static void goveeRender(const GoveeLook& L, uint32_t t, uint8_t out[][3]) {
+  const int n = L.n, nc = L.nc;
+  auto mix = [](const uint8_t* a, const uint8_t* b, float f, uint8_t* o) { for (int k = 0; k < 3; k++) o[k] = (uint8_t)(a[k] + (b[k] - a[k]) * f + 0.5f); };
+  auto hash = [](uint32_t x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; };
+  static const uint8_t black[3] = {0, 0, 0};
+  if (L.name == "flow") {                    // the colors spread along the light, drifting
+    float span = (float)n / nc, pos = t * (L.speed / 33000.0f);
+    for (int i = 0; i < n; i++) {
+      float x = (i + pos) / span; int k = (int)x; float f = x - k;
+      mix(L.col[k % nc], L.col[(k + 1) % nc], f, out[i]);
+    }
+  } else if (L.name == "chase") {            // a bright run with a fading tail over a dim second color
+    uint8_t bg[3]; mix(black, L.col[nc > 1 ? 1 : 0], nc > 1 ? 0.22f : 0.0f, bg);
+    float pos = fmodf(t * (L.speed / 12000.0f), (float)n);
+    float tail = n >= 12 ? 4.0f : 3.0f;
+    for (int i = 0; i < n; i++) {
+      float d = pos - i; if (d < 0) d += n;
+      mix(bg, L.col[0], d < tail ? 1.0f - d / tail : 0.0f, out[i]);
+    }
+  } else if (L.name == "twinkle") {          // a dim base; sections brighten and fade on their own
+    uint8_t base[3]; mix(black, L.col[0], 0.15f, base);
+    uint32_t period = 700 + 90000UL / L.speed;
+    for (int i = 0; i < n; i++) {
+      uint32_t tt = t + hash(i * 7919U + 13) % period, cell = tt / period;
+      float p = (float)(tt % period) / period, level = 0;
+      uint32_t h = hash(i * 131U + cell * 2654435761U);
+      if (h % 3 == 0) { float sn = sinf(3.14159f * p); level = sn * sn; }
+      mix(base, L.col[nc > 1 ? 1 + (h >> 8) % (nc - 1) : 0], level, out[i]);
+    }
+  } else if (L.name == "breathe") {          // the whole light swells through the colors in turn
+    float cyc = t * (L.speed / 200000.0f); int k = (int)cyc; float sn = sinf(3.14159f * (cyc - k));
+    for (int i = 0; i < n; i++) mix(black, L.col[k % nc], 0.04f + 0.96f * sn * sn, out[i]);
+  } else {                                   // blocks: the colors in turn, section by section, marching
+    int size = n >= nc * 4 ? 2 : 1;
+    uint32_t shift = (uint32_t)(t * (L.speed / 60000.0f));
+    for (int i = 0; i < n; i++) memcpy(out[i], L.col[((i + shift) / size) % nc], 3);
+  }
+}
+
+// Plays the looks: about 20 frames a second to every light that has one.
+static void goveeLookTask(void*) {
+  static uint8_t cols[GOVEE_MAX_SECTIONS][3];
+  static uint8_t pkt[6 + GOVEE_MAX_SECTIONS * 3 + 1];
+  static unsigned char b64[((sizeof pkt + 2) / 3) * 4 + 8];
+  auto razer = [&](const IPAddress& ip, uint8_t cmd, const uint8_t* data, size_t len) {
+    pkt[0] = 0xBB; pkt[1] = 0x00; pkt[2] = (uint8_t)len; pkt[3] = cmd;
+    memcpy(pkt + 4, data, len);
+    uint8_t x = 0; for (size_t i = 0; i < 4 + len; i++) x ^= pkt[i];
+    pkt[4 + len] = x;
+    size_t o = 0;
+    if (mbedtls_base64_encode(b64, sizeof b64, &o, pkt, 5 + len)) return;
+    b64[o] = 0;
+    String d = String("{\"pt\":\"") + (const char*)b64 + "\"}";
+    goveeSend(ip, 4003, "razer", d.c_str());
+  };
+  for (;;) {
+    delay(50);
+    if (WiFi.status() != WL_CONNECTED || updating) continue;
+    uint32_t now = millis();
+    for (int i = 0; i < nGovee; i++) {
+      if (xSemaphoreTake(goveeMx, pdMS_TO_TICKS(20)) != pdTRUE) continue;
+      Govee& g = govees[i];
+      IPAddress ip;
+      if (g.look.name.length() && ip.fromString(g.ip)) {
+        if (!g.look.enabledAt || now - g.look.enabledAt > 10000UL) {      // the light leaves this mode by itself after a minute of silence
+          const uint8_t on = 1; razer(ip, 0xB1, &on, 1);
+          g.look.enabledAt = now ? now : 1;
+        }
+        static uint8_t data[2 + GOVEE_MAX_SECTIONS * 3];
+        goveeRender(g.look, now - g.look.started, cols);
+        data[0] = 0; data[1] = g.look.n;
+        memcpy(data + 2, cols, g.look.n * 3);
+        razer(ip, 0xB0, data, 2 + g.look.n * 3);
+      }
+      xSemaphoreGive(goveeMx);
+    }
+  }
 }
 
 // Called from the status task on every pass: reads what lights have sent, and searches / asks for
@@ -745,6 +866,17 @@ static bool goveeOrder(JsonObjectConst o) {
     // three sent together was lost), so they go out 200 ms apart.
     bool first = true;
     auto gap = [&first]() { if (!first) delay(200); first = false; };
+    // A look ({"fx":{…}}) starts or stops; a plain color, or switching off, ends one.
+    bool hadLook = g.look.name.length() > 0;
+    if (o["fx"].is<JsonObjectConst>()) goveeSetLook(g, o["fx"]);
+    else if (o["col"].is<JsonArrayConst>() || (o["on"].is<bool>() && !o["on"].as<bool>())) g.look.name = "";
+    if (o["n"].is<int>()) g.look.n = constrain((int)o["n"], 1, GOVEE_MAX_SECTIONS);
+    if (o["speed"].is<int>() && g.look.name.length()) { g.look.speed = constrain((int)o["speed"], 1, 100); goveeDirty = true; statsDirty = true; }
+    if (hadLook && !g.look.name.length()) {       // hand the light back to its own color
+      gap(); goveeSend(ip, 4003, "razer", "{\"pt\":\"uwABsQAL\"}");
+    }
+    if (hadLook != (g.look.name.length() > 0) || o["fx"].is<JsonObjectConst>() || o["n"].is<int>()) { goveeDirty = true; statsDirty = true; }
+    if (g.look.name.length() && o["fx"].is<JsonObjectConst>() && !g.on && !o["on"].is<bool>()) { gap(); goveeSend(ip, 4003, "turn", "{\"value\":1}"); }
     if (o["on"].is<bool>()) { gap(); goveeSend(ip, 4003, "turn", o["on"].as<bool>() ? "{\"value\":1}" : "{\"value\":0}"); }
     if (o["bri"].is<int>()) {
       int v = constrain((int)o["bri"], 1, 100);
@@ -784,7 +916,8 @@ static void goveeList(JsonArray out) {
     Govee& g = govees[i];
     JsonObject o = out.add<JsonObject>();
     o["id"] = g.id; o["sku"] = g.sku; o["ip"] = g.ip; o["online"] = g.seen && now - g.seen < 75000UL;
-    o["on"] = g.on; o["bri"] = g.bri;
+    o["on"] = g.on; o["bri"] = g.bri; o["n"] = g.look.n;
+    if (g.look.name.length()) { o["fx"] = g.look.name; o["speed"] = g.look.speed; }
     JsonArray c = o["col"].to<JsonArray>(); c.add(g.r); c.add(g.g); c.add(g.b);
   }
   xSemaphoreGive(goveeMx);
@@ -2044,6 +2177,7 @@ void setup() {
   for (int i = 0; i < WORKERS; i++) xTaskCreatePinnedToCore(workerTask, "hgWork", 10240, nullptr, 1, nullptr, i % 2);
   xTaskCreatePinnedToCore(statusTask, "hgStatus", 10240, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(hubTask, "hgHub", 24576, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(goveeLookTask, "hgGovee", 6144, nullptr, 1, nullptr, 1);
 
   if (!provisioned) led(40, 0, 40);   // purple: needs its cloud login (the cloud connects from loop once Wi-Fi is up)
 }
