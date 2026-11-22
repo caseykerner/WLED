@@ -66,7 +66,7 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.12.1"
+#define BRIDGE_VERSION    "0.12.2"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -712,6 +712,19 @@ static bool goveeOrder(JsonObjectConst o) {
     if (o["bri"].is<int>()) {
       int v = constrain((int)o["bri"], 1, 100);
       gap(); goveeSend(ip, 4003, "brightness", (String("{\"value\":") + v + "}").c_str());
+    }
+    // Passed through as given, for the two commands Govee's own apps use beyond the basics:
+    // "razer" (live colors along the light) and "ptReal" (the light's Bluetooth packets, over Wi-Fi).
+    // {"raw":[{"cmd":"razer","data":{"pt":"<base64>"}}, …],"gapMs":<between them, default 0>}
+    JsonArrayConst raw = o["raw"];
+    int rawGap = constrain((int)(o["gapMs"] | 0), 0, 500);
+    for (JsonObjectConst r : raw) {
+      const char* cmd = r["cmd"] | "";
+      if (strcmp(cmd, "razer") && strcmp(cmd, "ptReal")) continue;
+      String data; serializeJson(r["data"], data);
+      if (!first && rawGap) delay(rawGap);
+      first = false;
+      goveeSend(ip, 4003, cmd, data.c_str());
     }
     JsonArrayConst c = o["col"];
     if (c.size() == 3) {
