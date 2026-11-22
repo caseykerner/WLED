@@ -36,12 +36,20 @@ jobs:
           0x0 bootloader.bin 0x8000 partitions.bin 0xe000 "$BOOT_APP0" 0x10000 firmware.bin
         cp firmware.bin bridge-app.bin
         ls -la bridge-full.bin bridge-app.bin
+    - name: Decode a crash backtrace (bridge/decode.txt, if present)
+      run: |
+        cd bridge
+        sha256sum .pio/build/bridge_s3_n16r8/firmware.elf
+        if [ -f decode.txt ]; then
+          ~/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-addr2line -pfiaC -e .pio/build/bridge_s3_n16r8/firmware.elf $(cat decode.txt)
+        fi
     - uses: actions/upload-artifact@v4
       with:
         name: homeglow-bridge
         path: |
           bridge/.pio/build/bridge_s3_n16r8/bridge-full.bin
           bridge/.pio/build/bridge_s3_n16r8/bridge-app.bin
+          bridge/.pio/build/bridge_s3_n16r8/firmware.elf
     - name: Draft release with the files (kept as a draft, never offered to anyone)
       uses: softprops/action-gh-release@v2
       with:
