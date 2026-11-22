@@ -35,6 +35,7 @@
 #include <LittleFS.h>
 #include <esp_system.h>
 #include <atomic>
+#include <memory>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -45,7 +46,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.3.3"
+#define BRIDGE_VERSION    "0.4.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -59,6 +60,8 @@ static bool provisioned = false;
 #define SCAN_EVERY_MS     300000UL
 #define MAX_CMD           2048
 #define ZIP_MIN           1500       // answers smaller than this aren't worth compressing
+#define DESIRED_MS        600000UL   // a look the hub was told to play is checked (and resent) for 10 minutes
+#define DESIRED_TRIES     3          // resent at most this often
 
 // One controller. The array never moves, so tasks can keep an index. Strings (ip, name, login) only
 // change in scan() under ctrlMx; other tasks copy them under ctrlMx. `lock` keeps it to one request
@@ -71,6 +74,13 @@ struct Controller {
   uint8_t misses = 0;
   uint32_t lastPoll = 0, lastInfo = 0, lastFull = 0, lastSmall = 0;
   uint32_t stateHash = 0;
+  // Hub as master (0.4): the last look the app asked the hub to play here, checked against what
+  // the controller is really doing and sent again if it isn't (missed it, powered up late).
+  std::string desiredBody;
+  String desiredSig;
+  uint32_t desiredAt = 0, onlineSince = 0;
+  uint8_t desiredTries = 0;
+  bool desiredOk = false;
   std::string info;                // last /json/info, raw
   SemaphoreHandle_t lock = nullptr;
 };
@@ -103,7 +113,12 @@ static std::vector<String> tunRecent;      // last few requests (method, control
 static std::vector<String> appLog;         // HomeGlow Dev's timeline lines (hg/applog/cmd), main task only
 
 // Work for the worker tasks.
-struct Job { bool tunnel; TunReq req; String login, body; };
+struct Job {
+  bool tunnel; TunReq req; String login, body;
+  bool play = false;                     // hub as master: send `look` to `login`
+  std::string look;
+  std::shared_ptr<Batch> batch;          // the request it belongs to (none for a resend)
+};
 static QueueHandle_t jobQ;
 
 // Everything published goes through the main task (PubSubClient isn't safe across tasks).
@@ -127,6 +142,41 @@ static void noteRefused(const String& what) {
 }
 
 static void led(uint8_t r, uint8_t g, uint8_t b) { neopixelWrite(LED_PIN, r, g, b); }
+
+// Big JSON documents (a batch of looks) go in PSRAM: plain malloc only uses internal memory here.
+struct SpiRamAllocator : ArduinoJson::Allocator {
+  void* allocate(size_t n) override { return ps_malloc(n); }
+  void deallocate(void* p) override { free(p); }
+  void* reallocate(void* p, size_t n) override { return ps_realloc(p, n); }
+};
+static SpiRamAllocator spiAlloc;
+
+// What identifies a look: animation and palette of every lit segment (same as the app's
+// DeviceStore.lookSignature, so both agree on "is it playing what was sent").
+static String lookSig(JsonArrayConst segs) {
+  std::vector<String> parts;
+  for (JsonObjectConst g : segs) {
+    if ((g["on"] | true) == false) continue;
+    if (g["stop"].is<int>() && (g["stop"] | 1) == 0) continue;
+    if (!g["fx"].is<int>()) continue;
+    String p = String((int)g["fx"]) + ":" + String((int)(g["pal"] | 0));
+    if (std::find(parts.begin(), parts.end(), p) == parts.end()) parts.push_back(p);
+  }
+  std::sort(parts.begin(), parts.end(), [](const String& a, const String& b) { return strcmp(a.c_str(), b.c_str()) < 0; });
+  String out;
+  for (auto& p : parts) { if (out.length()) out += ","; out += p; }
+  return out;
+}
+
+// One "play" request from the app: several controllers, answered together once all are done.
+struct Batch {
+  String id, reply;
+  int pending = 0;
+  std::string results = "{";
+  uint32_t started = 0;
+  SemaphoreHandle_t mx = nullptr;
+  ~Batch() { if (mx) vSemaphoreDelete(mx); }
+};
 
 static uint32_t fnv(const std::string& s) {
   uint32_t h = 2166136261u;
@@ -250,6 +300,44 @@ static void scan() {
   }
 }
 
+// Queues a look for one controller (a resend from the status task, or part of a batch).
+static bool enqueuePlay(const String& login, const std::string& look, std::shared_ptr<Batch> batch) {
+  Job* j = new Job; j->tunnel = false; j->play = true; j->login = login; j->look = look; j->batch = batch;
+  if (xQueueSend(jobQ, &j, pdMS_TO_TICKS(500)) != pdTRUE) { delete j; return false; }
+  return true;
+}
+
+// Hub as master: is the controller playing the look it was sent? Sends it again when it isn't
+// (it was off the network or powered up after the look went out, or a message got lost).
+// Stops checking when a saved preset takes over (a schedule, Autopilot, a button) or after 10 min.
+static void checkDesired(Controller& c, const String& login, const std::string& state, bool cameOnline) {
+  if (!c.desiredAt) return;
+  uint32_t now = millis();
+  if (now - c.desiredAt > DESIRED_MS) { c.desiredAt = 0; c.desiredBody.clear(); return; }
+  if (c.desiredSig.isEmpty()) return;
+  JsonDocument f; f["on"] = true; f["ps"] = true;
+  f["seg"][0]["fx"] = true; f["seg"][0]["pal"] = true; f["seg"][0]["on"] = true; f["seg"][0]["stop"] = true;
+  JsonDocument d(&spiAlloc);
+  if (deserializeJson(d, state, DeserializationOption::Filter(f))) return;
+  bool restarted = cameOnline && c.onlineSince > c.desiredAt;
+  if (!restarted && (d["ps"] | -1) > 0) { c.desiredAt = 0; c.desiredBody.clear(); return; }   // a preset took over
+  String sig = lookSig(d["seg"].as<JsonArrayConst>());
+  if (sig == c.desiredSig) { c.desiredOk = true; return; }
+  bool on = d["on"] | false;
+  if ((on || restarted) && c.desiredTries < DESIRED_TRIES) {
+    c.desiredTries++;
+    std::string look;
+    xSemaphoreTake(ctrlMx, portMAX_DELAY); look = c.desiredBody; xSemaphoreGive(ctrlMx);
+    if (enqueuePlay(login, look, nullptr)) {
+      xSemaphoreTake(ctrlMx, portMAX_DELAY);
+      tunRecent.push_back(String(now / 1000) + "s RESEND " + login + (restarted ? " (came online late)" : " (not playing it)") +
+                          " try " + String(c.desiredTries));
+      if (tunRecent.size() > 150) tunRecent.erase(tunRecent.begin());
+      xSemaphoreGive(ctrlMx);
+    }
+  }
+}
+
 // ---------- status (own task) ----------
 
 // Reads one controller's state (and its info when due) and publishes what changed:
@@ -291,6 +379,8 @@ static void poll(int i) {
   }
   if (c.direct) return;                    // it speaks for itself
   bool was = c.online; c.online = true;
+  if (!was) c.onlineSince = millis();
+  checkDesired(c, login, state, !was);
   uint32_t h = fnv(state);
   bool changed = h != c.stateHash || !was;
   c.stateHash = h;
@@ -309,7 +399,7 @@ static void poll(int i) {
     JsonDocument fi; fi["freeheap"] = true; fi["uptime"] = true; fi["ver"] = true;
     JsonDocument in; deserializeJson(in, c.info, DeserializationOption::Filter(fi));
     JsonDocument s;
-    s["online"] = true; s["via"] = "bridge";
+    s["online"] = true; s["via"] = "bridge"; s["hub"] = cloudId;
     s["on"] = st["on"] | false; s["bri"] = st["bri"] | 0; s["ps"] = st["ps"] | -1; s["pl"] = st["pl"] | -1;
     s["heap"] = in["freeheap"] | 0; s["up"] = in["uptime"] | 0; s["ver"] = in["ver"] | "";
     Out* o = new Out; o->topic = ("hg/" + login + "/state").c_str(); o->retained = true;
@@ -381,9 +471,81 @@ static void onTunnel(const String& login, uint8_t* payload, unsigned int len) {
   }
 }
 
+static void postBatchReply(std::shared_ptr<Batch> b) {
+  Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + b->reply).c_str(); o->id = b->id; o->status = 200;
+  o->ct = "application/json";
+  o->payload = b->results;
+  if (o->payload.size() > 1 && o->payload.back() == ',') o->payload.pop_back();
+  o->payload += "}";
+  post(o);
+}
+
+static void batchDone(std::shared_ptr<Batch> b, const String& login, int code) {
+  if (!b) return;
+  xSemaphoreTake(b->mx, portMAX_DELAY);
+  b->results += "\"" + std::string(login.c_str()) + "\":" + std::to_string(code) + ",";
+  bool last = --b->pending <= 0;
+  xSemaphoreGive(b->mx);
+  if (last) postBatchReply(b);
+}
+
+// Hub as master (main task): hg/<hub>/cmd carries looks for several controllers at once:
+//   {"id":…,"c":<app client>,"z":true} \n <raw-deflate of {"jobs":[{"c":"house","b":{…}},…]}>
+// Each controller gets its own look over the home network, all at the same time; the app gets
+// one answer with every controller's result. Each look is remembered and checked (checkDesired).
+static void onHubCommand(uint8_t* payload, unsigned int len) {
+  unsigned int nl = 0;
+  while (nl < len && payload[nl] != '\n') nl++;
+  if (nl >= len) { cmdsRefused++; return; }
+  JsonDocument h;
+  if (deserializeJson(h, (const char*)payload, nl)) { cmdsRefused++; return; }
+  auto b = std::make_shared<Batch>();
+  b->id = h["id"] | ""; b->reply = h["c"] | ""; b->started = millis(); b->mx = xSemaphoreCreateMutex();
+  const uint8_t* body = payload + nl + 1; size_t blen = len - nl - 1;
+  char* plain = nullptr; size_t plen = blen;
+  if (h["z"] | false) {
+    const size_t cap = 300 * 1024;
+    plain = (char*)ps_malloc(cap);
+    if (!plain) { cmdsRefused++; return; }
+    // The decompressor's ~11 KB state goes in PSRAM, not on the main task's 8 KB stack.
+    tinfl_decompressor* d = (tinfl_decompressor*)ps_malloc(sizeof(tinfl_decompressor));
+    if (!d) { free(plain); cmdsRefused++; return; }
+    tinfl_init(d);
+    size_t inBytes = blen, n = cap;
+    tinfl_status st = tinfl_decompress(d, body, &inBytes, (mz_uint8*)plain, (mz_uint8*)plain, &n,
+                                       TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    free(d);
+    if (st != TINFL_STATUS_DONE) { free(plain); cmdsRefused++; return; }
+    plen = n;
+  }
+  JsonDocument doc(&spiAlloc);
+  DeserializationError e = deserializeJson(doc, plain ? (const char*)plain : (const char*)body, plen);
+  if (plain) free(plain);
+  if (e) { cmdsRefused++; return; }
+  JsonArray jobs = doc["jobs"].as<JsonArray>();
+  b->pending = jobs.size();
+  if (b->pending == 0) { postBatchReply(b); return; }
+  for (JsonObject job : jobs) {
+    String login = job["c"] | "";
+    String ip;
+    int idx = findCtrl(login, ip);
+    if (idx < 0 || ip.isEmpty()) { batchDone(b, login, 404); continue; }
+    std::string look; serializeJson(job["b"], look);
+    String sig = job["b"]["seg"].is<JsonArray>() ? lookSig(job["b"]["seg"].as<JsonArrayConst>()) : String("");
+    Controller& c = ctrls[idx];
+    xSemaphoreTake(ctrlMx, portMAX_DELAY);
+    if (sig.length()) { c.desiredBody = look; c.desiredSig = sig; c.desiredAt = millis(); c.desiredTries = 0; c.desiredOk = false; }
+    else { c.desiredAt = 0; c.desiredBody.clear(); }      // on/off or brightness only: nothing to keep checking
+    xSemaphoreGive(ctrlMx);
+    cmdsIn++;
+    if (!enqueuePlay(login, look, b)) batchDone(b, login, 503);
+  }
+}
+
 static void onMessage(char* topic, uint8_t* payload, unsigned int len) {
   String t(topic);
   if (t.startsWith("hg/req/")) { onTunnel(t.substring(7), payload, len); return; }
+  if (cloudId.length() && t == "hg/" + cloudId + "/cmd") { onHubCommand(payload, len); return; }
   if (t == "hg/applog/cmd") {                // the app's diagnostics timeline, for /log
     String all((const char*)payload, len);
     int from = 0;
@@ -497,7 +659,11 @@ static void runTunnel(TunReq& r) {
     std::string z = deflate(o->payload);
     if (!z.empty() && z.size() < o->payload.size()) { zipSaved += o->payload.size() - z.size(); o->payload.swap(z); o->zip = true; }
   }
-  if (r.method != "GET") ctrls[idx].pollSoon = true;
+  if (r.method != "GET") {
+    ctrls[idx].pollSoon = true;
+    // Something else changed this controller through the app: stop holding it to the last look.
+    if (r.path.startsWith("/json/state") || r.path.startsWith("/json/si")) { xSemaphoreTake(ctrlMx, portMAX_DELAY); ctrls[idx].desiredAt = 0; xSemaphoreGive(ctrlMx); }
+  }
   tunDone++;
   uint32_t ms = millis() - r.started;
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
@@ -510,11 +676,33 @@ static void runTunnel(TunReq& r) {
   post(o);
 }
 
+// Hub as master: one controller's look from a batch (or a resend), sent over the home network.
+static void runPlay(Job& j) {
+  String ip;
+  int idx = findCtrl(j.login, ip);
+  if (idx < 0 || ip.isEmpty()) { cmdsRefused++; batchDone(j.batch, j.login, 404); return; }
+  uint32_t t0 = millis();
+  std::string out;
+  int code = 503;
+  if (xSemaphoreTake(ctrls[idx].lock, pdMS_TO_TICKS(15000)) == pdTRUE) {
+    code = wledRequest(ip, "POST", "/json/state", j.look, "application/json", out, nullptr, 3000, 8000);
+    xSemaphoreGive(ctrls[idx].lock);
+  }
+  if (code == 200) cmdsSent++; else cmdsRefused++;
+  ctrls[idx].pollSoon = true;              // check it took, and tell the app
+  xSemaphoreTake(ctrlMx, portMAX_DELAY);
+  tunRecent.push_back(String(millis() / 1000) + "s PLAY " + j.login + " " + String(code) + " " + String(millis() - t0) + "ms " +
+                      String((uint32_t)j.look.size()) + "b" + (j.batch ? "" : " (resend)"));
+  if (tunRecent.size() > 150) tunRecent.erase(tunRecent.begin());
+  xSemaphoreGive(ctrlMx);
+  batchDone(j.batch, j.login, code > 0 ? code : 504);
+}
+
 static void workerTask(void*) {
   for (;;) {
     Job* j = nullptr;
     if (xQueueReceive(jobQ, &j, portMAX_DELAY) != pdTRUE || !j) continue;
-    if (j->tunnel) runTunnel(j->req); else runCommand(*j);
+    if (j->tunnel) runTunnel(j->req); else if (j->play) runPlay(*j); else runCommand(*j);
     delete j;
   }
 }
@@ -650,6 +838,7 @@ static void webStatusJson() {
     Controller& c = ctrls[i];
     JsonObject o = a.add<JsonObject>();
     o["name"] = c.name; o["ip"] = c.ip; o["login"] = c.login; o["online"] = (bool)c.online; o["direct"] = c.direct;
+    if (c.desiredAt) { o["holding"] = (millis() - c.desiredAt) / 1000; o["playing"] = c.desiredOk; o["resends"] = c.desiredTries; }
   }
   xSemaphoreGive(ctrlMx);
   String s; serializeJson(d, s);
