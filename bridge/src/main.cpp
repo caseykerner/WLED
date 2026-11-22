@@ -66,7 +66,7 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.13.0"
+#define BRIDGE_VERSION    "0.13.1"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -758,7 +758,10 @@ static void goveeLookTask(void*) {
       Govee& g = govees[i];
       IPAddress ip;
       if (g.look.name.length() && ip.fromString(g.ip)) {
-        if (!g.look.enabledAt || now - g.look.enabledAt > 10000UL) {      // the light leaves this mode by itself after a minute of silence
+        // The light is put into this mode once: when the look starts, and again when the light
+        // comes back after being quiet (it leaves the mode by itself after a minute without colors).
+        // Not on a timer: each time it is told, the light blinks off and on.
+        if (!g.look.enabledAt) {
           const uint8_t on = 1; razer(ip, 0xB1, &on, 1);
           g.look.enabledAt = now ? now : 1;
         }
@@ -776,7 +779,10 @@ static void goveeLookTask(void*) {
 // Called from the status task on every pass: reads what lights have sent, and searches / asks for
 // status when due. Nothing here waits.
 static void goveePoll() {
-  if (!goveeListening) { goveeListening = goveeIn.begin(4002) == 1; if (!goveeListening) return; }
+  // Messages always leave from the same port (4005): a light that has been talking to the hub seems
+  // to ignore a "new" sender for about three minutes, and a random port made the hub one after
+  // every restart.
+  if (!goveeListening) { goveeListening = goveeIn.begin(4002) == 1; if (!goveeListening) return; goveeOut.begin(4005); }
   uint32_t now = millis();
   for (int guard = 0; guard < 16; guard++) {
     int n = goveeIn.parsePacket();
@@ -814,6 +820,7 @@ static void goveePoll() {
         bool on = (data["onOff"] | 0) != 0;
         uint8_t bri = data["brightness"] | 0, r = data["color"]["r"] | 0, gr = data["color"]["g"] | 0, b = data["color"]["b"] | 0;
         if (on != g.on || bri != g.bri || r != g.r || gr != g.g || b != g.b || !g.seen) statsDirty = true;
+        if (!g.seen || now - g.seen > 40000UL) g.look.enabledAt = 0;      // back after being quiet: its look has to be started again
         g.on = on; g.bri = bri; g.r = r; g.g = gr; g.b = b; g.seen = now ? now : 1;
       }
     }
