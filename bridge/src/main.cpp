@@ -113,6 +113,7 @@ static std::vector<String> tunRecent;      // last few requests (method, control
 static std::vector<String> appLog;         // HomeGlow Dev's timeline lines (hg/applog/cmd), main task only
 
 // Work for the worker tasks.
+struct Batch;
 struct Job {
   bool tunnel; TunReq req; String login, body;
   bool play = false;                     // hub as master: send `look` to `login`
