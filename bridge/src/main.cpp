@@ -53,7 +53,7 @@ static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.9.1"
+#define BRIDGE_VERSION    "0.9.2"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -278,29 +278,13 @@ static int findCtrl(const String& login, String& ip) {
 
 // ---------- local WLED API ----------
 
-// Collects an HTTP answer into a std::string (HTTPClient::writeToStream handles both a known
-// length and chunked answers).
-class StrStream : public Stream {
- public:
-  explicit StrStream(std::string& s, size_t max) : buf_(s), limit_(max) {}
-  size_t write(uint8_t c) override { return write(&c, 1); }
-  size_t write(const uint8_t* b, size_t n) override {
-    if (buf_.size() + n > limit_) return 0;
-    buf_.append((const char*)b, n); return n;
-  }
-  int available() override { return 0; }
-  int read() override { return -1; }
-  int peek() override { return -1; }
-  void flush() override {}
- private:
-  std::string& buf_; size_t limit_;
-};
 
 // One request to a controller. Returns the HTTP status (or a negative HTTPClient error).
 static int wledRequest(const String& ip, const String& method, const String& path, const std::string& body,
                        const String& ct, std::string& out, String* outCt, uint32_t connectMs, uint32_t timeoutMs) {
   HTTPClient http;
   http.setReuse(false);                    // "Connection: close", so an answer of unknown length ends
+  http.useHTTP10(true);                    // no chunked answers: the body is read below as plain bytes
   http.setConnectTimeout(connectMs);
   http.setTimeout(timeoutMs);
   if (!http.begin("http://" + ip + path)) return -1;
@@ -311,8 +295,32 @@ static int wledRequest(const String& ip, const String& method, const String& pat
            : http.sendRequest(method.c_str(), (uint8_t*)body.data(), body.size());
   if (code > 0) {
     if (outCt) *outCt = http.header("Content-Type");
-    StrStream s(out, TUN_MAX_BODY);
-    http.writeToStream(&s);
+    // The body is read here, not with HTTPClient::writeToStream: that one waits for ever when the
+    // controller loses power in the middle of an answer (its relay switching off), which froze
+    // the status task for good (0.9.1, Nov 22). Here silence longer than timeoutMs, or more than
+    // 20 s in all, ends the read as a failure.
+    WiFiClient* in = http.getStreamPtr();
+    int len = http.getSize();              // -1: unknown, ends when the controller closes
+    uint32_t started = millis(), last = started;
+    uint8_t buf[1024];
+    bool failed = false;
+    while (in && (len > 0 || len == -1) && out.size() < TUN_MAX_BODY) {
+      int n = in->available();
+      if (n > 0) {
+        n = in->read(buf, std::min((size_t)n, len > 0 ? std::min(sizeof buf, (size_t)len) : sizeof buf));
+        if (n <= 0) continue;
+        out.append((const char*)buf, n);
+        if (len > 0) len -= n;
+        last = millis();
+      } else if (!in->connected()) {
+        failed = len > 0;                  // closed before everything promised arrived
+        break;
+      } else {
+        if (millis() - last > timeoutMs || millis() - started > 20000) { failed = true; break; }
+        delay(2);
+      }
+    }
+    if (failed) { out.clear(); code = -11; }
   }
   http.end();
   return code;
