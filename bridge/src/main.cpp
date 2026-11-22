@@ -40,13 +40,15 @@
 #include <string>
 #include <algorithm>
 #include "miniz.h"
+#include <esp_heap_caps.h>
+#include <mbedtls/platform.h>
 
 // Cloud login, loaded onto each bridge after flashing (POST /provision from the home network),
 // kept in /cloud.json. The firmware file itself holds no secrets.
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.6.0"
+#define BRIDGE_VERSION    "0.7.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -120,6 +122,29 @@ struct HubEvent { uint32_t at; String text; };
 static std::vector<HubEvent> hubEvents;
 static std::atomic<uint32_t> playsDone{0}, resendsDone{0};
 static volatile bool statsDirty = true;
+// ---------- update / setup lock ----------
+// Firmware updates and a new cloud login are only taken when the owner allows it: for 15 minutes
+// after the hub is plugged in (someone is physically there), when it has no cloud login yet, or for
+// 10 minutes after the owner taps "Allow updates" in the app (sent through AWS, so it needs the
+// owner's cloud login). Anyone else on the home network gets "locked".
+static uint32_t unlockUntil = 0;          // millis(); 0 = locked
+static bool powerOnWindow = false;        // the first 15 minutes after a power-on or reset-pin start
+static bool setupAllowed() {
+  if (!provisioned) return true;
+  if (powerOnWindow && millis() < 15UL * 60 * 1000) return true;
+  return unlockUntil && (int32_t)(unlockUntil - millis()) > 0;
+}
+static void sendLocked() {
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  web.send(403, "text/plain", "locked: tap Allow updates on the Hub page in the HomeGlow app, or unplug the hub and plug it back in");
+}
+
+// Internal memory (not PSRAM) is what runs out first: the AWS connection, Wi-Fi and the tasks all
+// need it. Below ~30 KB a reconnect can fail, so the Hub page warns well before that.
+static bool lowMemory() {
+  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 30000 || heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 12000;
+}
+
 static void hubEvent(const String& text) {
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
   hubEvents.push_back({millis(), text});
@@ -443,6 +468,11 @@ static void publishStats() {
   d["hub"] = true; d["ver"] = BRIDGE_VERSION; d["up"] = now / 1000; d["reset"] = resetReason;
   d["crashStage"] = lastCrashStage; d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap();
   d["psram"] = ESP.getFreePsram(); d["rssi"] = WiFi.RSSI(); d["ip"] = WiFi.localIP().toString();
+  d["internal"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL); d["largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  bool low = lowMemory(); d["lowMem"] = low;
+  static bool wasLow = false;
+  if (low != wasLow) { wasLow = low; hubEvent(low ? "Memory is running low" : "Memory back to normal"); }
+  d["updates"] = setupAllowed();
   d["connects"] = (uint32_t)connects; d["plays"] = (uint32_t)playsDone; d["resends"] = (uint32_t)resendsDone;
   uint32_t n = tunDone; d["requests"] = n; d["avgMs"] = n ? (uint32_t)(tunMsTotal / n) : 0;
   JsonArray cs = d["controllers"].to<JsonArray>();
@@ -571,6 +601,16 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
   JsonDocument h;
   if (deserializeJson(h, (const char*)payload, nl)) { cmdsRefused++; return nullptr; }
   STAGE(102);
+  // The owner's "Allow updates" from the app (only possible through AWS, never from /hub/play).
+  if ((h["unlock"] | false) && !(h["local"] | false)) {
+    unlockUntil = millis() + 10UL * 60 * 1000; if (!unlockUntil) unlockUntil = 1;
+    hubEvent("Updates allowed for 10 minutes");
+    statsDirty = true;
+    Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + String((const char*)(h["c"] | ""))).c_str();
+    o->id = (const char*)(h["id"] | ""); o->status = 200; o->ct = "application/json"; o->payload = "{\"unlocked\":600}";
+    post(o);
+    return nullptr;
+  }
   auto b = std::make_shared<Batch>();
   b->id = h["id"] | ""; b->reply = h["c"] | ""; b->started = millis(); b->mx = xSemaphoreCreateMutex();
   if (h["local"] | false) b->done = xSemaphoreCreateBinary();
@@ -897,7 +937,9 @@ static void webRoot() {
   web.send(200, "text/html", h);
 }
 
+static bool updateRefused = false;
 static void webUpdateDone() {
+  if (updateRefused) { updateRefused = false; sendLocked(); return; }
   web.send(200, "text/plain", Update.hasError() ? "Update failed" : "Updated, restarting");
   delay(500);
   if (!Update.hasError()) ESP.restart();
@@ -905,7 +947,13 @@ static void webUpdateDone() {
 
 static void webUpdateChunk() {
   HTTPUpload& u = web.upload();
-  if (u.status == UPLOAD_FILE_START) Update.begin(UPDATE_SIZE_UNKNOWN);
+  if (u.status == UPLOAD_FILE_START) {
+    updateRefused = !setupAllowed();
+    if (updateRefused) return;
+    hubEvent("Installing a software update");
+    Update.begin(UPDATE_SIZE_UNKNOWN);
+  }
+  if (updateRefused) return;
   else if (u.status == UPLOAD_FILE_WRITE) Update.write(u.buf, u.currentSize);
   else if (u.status == UPLOAD_FILE_END) Update.end(true);
 }
@@ -935,20 +983,14 @@ static void webHubPlay() {
   web.send(200, "application/json", b->results.c_str());
 }
 
-// Local test of a hub command (same body as hg/<hub>/cmd), from the home network only.
-static void webPlay() {
-  String body = web.arg("plain");
-  queueHubCommand((const uint8_t*)body.c_str(), body.length());
-  web.sendHeader("Access-Control-Allow-Origin", "*");
-  web.send(200, "text/plain", "queued");
-}
-
 static void webStatusJson() {
   JsonDocument d;
   d["ver"] = BRIDGE_VERSION; d["id"] = cloudId; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected(); d["err"] = lastMqttErr;
   d["reset"] = resetReason; d["crashStage"] = lastCrashStage;
   d["connects"] = (uint32_t)connects; d["in"] = (uint32_t)cmdsIn; d["sent"] = (uint32_t)cmdsSent; d["refused"] = (uint32_t)cmdsRefused;
   d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
+  d["internal"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL); d["largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  d["lowMem"] = lowMemory(); d["updates"] = setupAllowed();
   uint32_t n = tunDone;
   d["tunnel"] = n; d["tunnelRefused"] = (uint32_t)tunRefused; d["shortWrites"] = (uint32_t)shortWrites;
   d["avgMs"] = n ? (uint32_t)(tunMsTotal / n) : 0; d["avgWledMs"] = n ? (uint32_t)(wledMsTotal / n) : 0;
@@ -986,9 +1028,10 @@ static bool loadCloud() {
          cloudCert.indexOf("BEGIN") >= 0 && cloudKey.indexOf("PRIVATE KEY") >= 0;
 }
 
-// Prototype: accepted from the home network. A shipping bridge would only take this during setup
-// (button held, or straight after Wi-Fi setup) so nobody else on the network can swap the login.
+// A new cloud login: only while setup is allowed (see setupAllowed), so nobody else on the
+// network can swap it.
 static void webProvision() {
+  if (!setupAllowed()) { sendLocked(); return; }
   String body = web.arg("plain");
   JsonDocument d;
   if (deserializeJson(d, body) || !(d["cert"].is<const char*>())) { web.send(400, "text/plain", "bad"); return; }
@@ -1008,6 +1051,16 @@ static void webCors() {
   web.send(204);
 }
 
+
+// The TLS connection to AWS keeps ~40 KB of buffers. By default they're in the chip's own memory
+// (about 320 KB, shared with Wi-Fi and everything else); larger ones go in the 8 MB PSRAM instead.
+static void* tlsCalloc(size_t n, size_t size) {
+  void* p = nullptr;
+  if (n * size >= 512) p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  return p;
+}
+static void tlsFree(void* p) { heap_caps_free(p); }
 
 // ---------- setup / loop ----------
 
@@ -1029,6 +1082,8 @@ void setup() {
   resetReason = resetName(esp_reset_reason());
   if (esp_reset_reason() == ESP_RST_PANIC || esp_reset_reason() == ESP_RST_TASK_WDT || esp_reset_reason() == ESP_RST_INT_WDT) lastCrashStage = crashStage;
   crashStage = 0;
+  powerOnWindow = esp_reset_reason() == ESP_RST_POWERON || esp_reset_reason() == ESP_RST_EXT;
+  if (psramFound() && ESP.getPsramSize() > 0) mbedtls_platform_set_calloc_free(tlsCalloc, tlsFree);
   led(0, 0, 40);
   LittleFS.begin(true);
   provisioned = loadCloud();
@@ -1063,7 +1118,6 @@ void setup() {
   web.on("/", webRoot);
   web.on("/json", webStatusJson);
   web.on("/log", webLog);
-  web.on("/play", HTTP_POST, webPlay);
   web.on("/hub/play", HTTP_POST, webHubPlay);
   web.on("/update", HTTP_POST, webUpdateDone, webUpdateChunk);
   web.on("/provision", HTTP_POST, webProvision);
