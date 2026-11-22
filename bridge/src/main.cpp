@@ -46,7 +46,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.5.0"
+#define BRIDGE_VERSION    "0.6.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -192,7 +192,8 @@ struct Batch {
   std::string results = "{";
   uint32_t started = 0;
   SemaphoreHandle_t mx = nullptr;
-  ~Batch() { if (mx) vSemaphoreDelete(mx); }
+  SemaphoreHandle_t done = nullptr;      // asked over the home network: the answer is waited for
+  ~Batch() { if (mx) vSemaphoreDelete(mx); if (done) vSemaphoreDelete(done); }
 };
 
 static uint32_t fnv(const std::string& s) {
@@ -533,7 +534,13 @@ static void postBatchReply(std::shared_ptr<Batch> b) {
   int n = std::count(b->results.begin(), b->results.end(), ':');
   int ok = 0; for (size_t p = b->results.find(":200"); p != std::string::npos; p = b->results.find(":200", p + 1)) ok++;
   hubEvent(String("Look sent to ") + String(n) + (n == 1 ? " controller" : " controllers") + " in " + String(millis() - b->started) + " ms" +
-           (ok < n ? " (" + String(n - ok) + " didn't answer)" : ""));
+           (ok < n ? " (" + String(n - ok) + " didn't answer)" : "") + (b->done ? " (from home)" : ""));
+  if (b->done) {                           // the home-network caller is waiting for it
+    if (b->results.size() > 1 && b->results.back() == ',') b->results.pop_back();
+    b->results += "}";
+    xSemaphoreGive(b->done);
+    return;
+  }
   Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + b->reply).c_str(); o->id = b->id; o->status = 200;
   o->ct = "application/json";
   o->payload = b->results;
@@ -556,32 +563,33 @@ static void batchDone(std::shared_ptr<Batch> b, const String& login, int code) {
 //   {"id":…,"c":<app client>,"z":true} \n <raw-deflate of {"jobs":[{"c":"house","b":{…}},…]}>
 // Each controller gets its own look over the home network, all at the same time; the app gets
 // one answer with every controller's result. Each look is remembered and checked (checkDesired).
-static void onHubCommand(uint8_t* payload, unsigned int len) {
+static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
   STAGE(101);
   unsigned int nl = 0;
   while (nl < len && payload[nl] != '\n') nl++;
-  if (nl >= len) { cmdsRefused++; return; }
+  if (nl >= len) { cmdsRefused++; return nullptr; }
   JsonDocument h;
-  if (deserializeJson(h, (const char*)payload, nl)) { cmdsRefused++; return; }
+  if (deserializeJson(h, (const char*)payload, nl)) { cmdsRefused++; return nullptr; }
   STAGE(102);
   auto b = std::make_shared<Batch>();
   b->id = h["id"] | ""; b->reply = h["c"] | ""; b->started = millis(); b->mx = xSemaphoreCreateMutex();
+  if (h["local"] | false) b->done = xSemaphoreCreateBinary();
   const uint8_t* body = payload + nl + 1; size_t blen = len - nl - 1;
   char* plain = nullptr; size_t plen = blen;
   if (h["z"] | false) {
     const size_t cap = 300 * 1024;
     plain = (char*)ps_malloc(cap);
-    if (!plain) { cmdsRefused++; return; }
+    if (!plain) { cmdsRefused++; return nullptr; }
     // The decompressor's ~11 KB state goes in PSRAM, not on the main task's 8 KB stack.
     tinfl_decompressor* d = (tinfl_decompressor*)ps_malloc(sizeof(tinfl_decompressor));
-    if (!d) { free(plain); cmdsRefused++; return; }
+    if (!d) { free(plain); cmdsRefused++; return nullptr; }
     tinfl_init(d);
     STAGE(103);
     size_t inBytes = blen, n = cap;
     tinfl_status st = tinfl_decompress(d, body, &inBytes, (mz_uint8*)plain, (mz_uint8*)plain, &n,
                                        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
     free(d);
-    if (st != TINFL_STATUS_DONE) { free(plain); cmdsRefused++; return; }
+    if (st != TINFL_STATUS_DONE) { free(plain); cmdsRefused++; return nullptr; }
     plen = n;
   }
   STAGE(104);
@@ -589,10 +597,10 @@ static void onHubCommand(uint8_t* payload, unsigned int len) {
   DeserializationError e = deserializeJson(doc, plain ? (const char*)plain : (const char*)body, plen);
   STAGE(105);
   if (plain) free(plain);
-  if (e) { cmdsRefused++; return; }
+  if (e) { cmdsRefused++; return nullptr; }
   JsonArray jobs = doc["jobs"].as<JsonArray>();
   b->pending = jobs.size();
-  if (b->pending == 0) { postBatchReply(b); return; }
+  if (b->pending == 0) { postBatchReply(b); return b; }
   for (JsonObject job : jobs) {
     STAGE(106);
     String login = job["c"] | "";
@@ -612,6 +620,7 @@ static void onHubCommand(uint8_t* payload, unsigned int len) {
     if (!enqueuePlay(login, look, b)) batchDone(b, login, 503);
   }
   STAGE(109);
+  return b;
 }
 
 // Hub commands are unpacked in their own task: inflating a batch needs far more stack than the
@@ -914,6 +923,18 @@ static void webLog() {
   web.send(200, "text/plain", out);
 }
 
+// Hub as master from the home network (0.6): the app at home posts {"jobs":[…]} here instead of
+// going through AWS, and gets every controller's result back in the same answer.
+static void webHubPlay() {
+  String body = web.arg("plain");
+  std::string msg = "{\"id\":\"local\",\"c\":\"\",\"local\":true}\n";
+  msg += body.c_str();
+  auto b = onHubCommand((uint8_t*)msg.data(), msg.size());
+  if (!b) { web.send(400, "text/plain", "bad"); return; }
+  if (!b->done || xSemaphoreTake(b->done, pdMS_TO_TICKS(10000)) != pdTRUE) { web.send(504, "text/plain", "timeout"); return; }
+  web.send(200, "application/json", b->results.c_str());
+}
+
 // Local test of a hub command (same body as hg/<hub>/cmd), from the home network only.
 static void webPlay() {
   String body = web.arg("plain");
@@ -1043,6 +1064,7 @@ void setup() {
   web.on("/json", webStatusJson);
   web.on("/log", webLog);
   web.on("/play", HTTP_POST, webPlay);
+  web.on("/hub/play", HTTP_POST, webHubPlay);
   web.on("/update", HTTP_POST, webUpdateDone, webUpdateChunk);
   web.on("/provision", HTTP_POST, webProvision);
   web.on("/provision", HTTP_OPTIONS, webCors);
