@@ -46,7 +46,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.4.3"
+#define BRIDGE_VERSION    "0.4.4"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -697,7 +697,13 @@ static void runTunnel(TunReq& r) {
   if (r.method != "GET") {
     ctrls[idx].pollSoon = true;
     // Something else changed this controller through the app: stop holding it to the last look.
-    if (r.path.startsWith("/json/state") || r.path.startsWith("/json/si")) { xSemaphoreTake(ctrlMx, portMAX_DELAY); ctrls[idx].desiredAt = 0; xSemaphoreGive(ctrlMx); }
+    // Only a new look or a preset ends it: the app's follow-ups (brightness, sync settings a few
+    // seconds after a look) left the hub holding nothing in 0.4.3.
+    bool newLook = r.body.find("\"seg\"") != std::string::npos || r.body.find("\"ps\"") != std::string::npos ||
+                   r.body.find("\"pl\"") != std::string::npos;
+    if (newLook && (r.path.startsWith("/json/state") || r.path.startsWith("/json/si"))) {
+      xSemaphoreTake(ctrlMx, portMAX_DELAY); ctrls[idx].desiredAt = 0; xSemaphoreGive(ctrlMx);
+    }
   }
   tunDone++;
   uint32_t ms = millis() - r.started;
