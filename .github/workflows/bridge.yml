@@ -45,9 +45,9 @@ jobs:
     - name: Draft release with the files (kept as a draft, never offered to anyone)
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: bridge-v0.4.2
+        tag_name: bridge-v0.4.3
         target_commitish: ${{ github.sha }}
-        name: HomeGlow Bridge 0.4.2 (prototype)
+        name: HomeGlow Bridge 0.4.3 (prototype)
         draft: true
         files: |
           bridge/.pio/build/bridge_s3_n16r8/bridge-full.bin
