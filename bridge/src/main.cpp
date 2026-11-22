@@ -31,7 +31,10 @@
 #include <Update.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <WiFiManager.h>
+#include <NimBLEDevice.h>
+#include <mbedtls/gcm.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/base64.h>
 #include <LittleFS.h>
 #include <esp_system.h>
 #include <atomic>
@@ -47,8 +50,9 @@
 // kept in /cloud.json. The firmware file itself holds no secrets.
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
+static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.7.0"
+#define BRIDGE_VERSION    "0.8.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -922,7 +926,7 @@ static void webRoot() {
   String h = "<!doctype html><meta name=viewport content='width=device-width'><title>HomeGlow Bridge</title>"
              "<style>body{font:15px -apple-system,sans-serif;background:#111;color:#eee;padding:16px}td{padding:4px 10px}</style>"
              "<h2>HomeGlow Bridge " BRIDGE_VERSION "</h2><p>Cloud: ";
-  h += !provisioned ? String("needs its cloud login") : (mqtt.connected() ? String("connected") : ("not connected (" + String(lastMqttErr) + ")"));
+  h += !provisioned ? String("needs its cloud login (setup code ") + setupCode + ")" : (mqtt.connected() ? String("connected") : ("not connected (" + String(lastMqttErr) + ")"));
   h += "<br>Free memory: " + String(ESP.getFreeHeap() / 1024) + " KB · extra memory: " + String(ESP.getFreePsram() / 1024) + " KB";
   h += "<br>Last restart: " + String(resetReason);
   h += "<br>Remote requests: " + String((uint32_t)tunDone) + (tunDone ? " (average " + String((uint32_t)(tunMsTotal / tunDone)) + " ms)" : String("")) + "</p><table>";
@@ -1062,6 +1066,222 @@ static void* tlsCalloc(size_t n, size_t size) {
 }
 static void tlsFree(void* p) { heap_caps_free(p); }
 
+// ---------- Bluetooth setup ----------
+// A new hub has no Wi-Fi. The HomeGlow app finds it over Bluetooth (service HG_SVC), checks the
+// setup code printed on the hub's label, and sends the home Wi-Fi name and password. The password
+// travels encrypted: AES-256-GCM with key = SHA-256(setup code + ":" + this session's nonce), so only
+// a phone that has the label's code can set up (or re-set up) the hub.
+// Bluetooth is on only while setup is allowed (setupAllowed(), the same lock as software updates) or
+// while the hub has no Wi-Fi that works; otherwise it's switched off and its memory given back.
+//
+// Messages are JSON. The app writes to HG_CMD; the hub answers on HG_EVT (notify), split into
+// pieces of at most ~150 bytes: the first byte of each piece is 1 when more follows, 0 on the last.
+//   {"op":"info"}                     -> {"op":"info","name","mac","id","ver","provisioned","nonce",
+//                                         "wifi":{"ssid","connected","ip","rssi"}}
+//   {"op":"scan"}                     -> {"op":"scan","nets":[{"s":ssid,"r":rssi,"l":locked},…]}
+//   {"op":"wifi","c":<base64 of GCM nonce(12)+ciphertext+tag(16)>}, plaintext {"ssid","pw"}
+//                                     -> {"op":"wifi","state":"connecting"} then
+//                                        {"op":"wifi","state":"connected","ip"} or
+//                                        {"op":"wifi","state":"failed","reason"}
+//   {"op":"done"}                     -> Bluetooth off (after the app has what it needs)
+#define HG_SVC "9f3c0001-6b1e-4f5a-9a8e-486f6d65476c"
+#define HG_CMD "9f3c0002-6b1e-4f5a-9a8e-486f6d65476c"
+#define HG_EVT "9f3c0003-6b1e-4f5a-9a8e-486f6d65476c"
+#define SETUP_FILE "/setup.json"
+
+static uint8_t bleNonce[16];
+static bool bleOn = false;
+static uint32_t bleOffAt = 0;             // when "done" was asked for, or 0
+static NimBLECharacteristic* bleEvt = nullptr;
+static QueueHandle_t bleQ;                // commands from the Bluetooth task to hgSetup
+static volatile bool bleConnected = false;
+static uint32_t wifiLostSince = 0;        // millis() since the saved Wi-Fi stopped working (0 = fine)
+static bool mdnsUp = false;
+static bool bleDismissed = false;         // the app said "done": stay off until the Wi-Fi breaks or the hub restarts
+
+static void loadSetupCode() {
+  File f = LittleFS.open(SETUP_FILE, "r");
+  if (f) { JsonDocument d; if (!deserializeJson(d, f)) setupCode = (const char*)(d["code"] | ""); f.close(); }
+  if (setupCode.length() < 6) {
+    // No label code (a board flashed by hand): make one and keep it. Shown on the serial port and,
+    // until the hub has its cloud login, on its own web page.
+    const char* abc = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+    setupCode = "";
+    for (int i = 0; i < 8; i++) setupCode += abc[esp_random() % 31];
+    File w = LittleFS.open(SETUP_FILE, "w");
+    if (w) { w.print("{\"code\":\"" + setupCode + "\"}"); w.close(); }
+  }
+  Serial.println("Setup code: " + setupCode);
+}
+
+static String hubName() {
+  uint8_t m[6]; WiFi.macAddress(m);
+  char b[24]; snprintf(b, sizeof b, "HomeGlow Hub %02X%02X", m[4], m[5]);
+  return b;
+}
+
+static void bleSend(const String& json) {
+  if (!bleEvt || !bleConnected) return;
+  const size_t piece = 150;
+  size_t at = 0, n = json.length();
+  do {
+    size_t len = std::min(piece, n - at);
+    uint8_t buf[piece + 1];
+    buf[0] = (at + len < n) ? 1 : 0;
+    memcpy(buf + 1, json.c_str() + at, len);
+    bleEvt->setValue(buf, len + 1);
+    bleEvt->notify();
+    at += len;
+    delay(8);
+  } while (at < n);
+}
+
+class BleServerCB : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* s) override { bleConnected = true; esp_fill_random(bleNonce, sizeof bleNonce); }
+  void onDisconnect(NimBLEServer* s) override { bleConnected = false; if (bleOn && !bleOffAt) NimBLEDevice::startAdvertising(); }
+};
+class BleCmdCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();
+    if (v.empty() || v.size() > 600) return;
+    std::string* m = new std::string(v);
+    if (xQueueSend(bleQ, &m, 0) != pdTRUE) delete m;
+  }
+};
+
+static void bleStart() {
+  if (bleOn) return;
+  NimBLEDevice::init(hubName().c_str());
+  NimBLEDevice::setMTU(247);
+  NimBLEServer* s = NimBLEDevice::createServer();
+  s->setCallbacks(new BleServerCB());
+  NimBLEService* svc = s->createService(HG_SVC);
+  svc->createCharacteristic(HG_CMD, NIMBLE_PROPERTY::WRITE)->setCallbacks(new BleCmdCB());
+  bleEvt = svc->createCharacteristic(HG_EVT, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
+  svc->start();
+  NimBLEAdvertising* a = NimBLEDevice::getAdvertising();
+  a->addServiceUUID(HG_SVC);
+  a->setScanResponse(true);
+  a->start();
+  bleOn = true; bleOffAt = 0;
+  hubEvent("Bluetooth setup is on");
+}
+
+static void bleStop() {
+  if (!bleOn) return;
+  bleEvt = nullptr; bleConnected = false;
+  NimBLEDevice::deinit(true);             // gives Bluetooth's memory back
+  bleOn = false; bleOffAt = 0;
+  hubEvent("Bluetooth setup is off");
+}
+
+static String b64(const uint8_t* p, size_t n) {
+  size_t o = 0; std::vector<unsigned char> out(n * 4 / 3 + 8);
+  mbedtls_base64_encode(out.data(), out.size(), &o, p, n);
+  return String((const char*)out.data()).substring(0, o);
+}
+
+// Opens the app's sealed {"ssid","pw"}; false when the code was wrong or the message was altered.
+static bool openSealed(const char* c64, JsonDocument& out) {
+  size_t n = 0; size_t inLen = strlen(c64);
+  std::vector<unsigned char> raw(inLen * 3 / 4 + 4);
+  if (mbedtls_base64_decode(raw.data(), raw.size(), &n, (const unsigned char*)c64, inLen) || n < 12 + 16 + 2) return false;
+  uint8_t key[32];
+  String seed = setupCode + ":";
+  mbedtls_sha256_context sh; mbedtls_sha256_init(&sh); mbedtls_sha256_starts_ret(&sh, 0);
+  mbedtls_sha256_update_ret(&sh, (const unsigned char*)seed.c_str(), seed.length());
+  mbedtls_sha256_update_ret(&sh, bleNonce, sizeof bleNonce);
+  mbedtls_sha256_finish_ret(&sh, key); mbedtls_sha256_free(&sh);
+  size_t ctLen = n - 12 - 16;
+  std::vector<unsigned char> plain(ctLen + 1, 0);
+  mbedtls_gcm_context g; mbedtls_gcm_init(&g);
+  int r = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
+  if (!r) r = mbedtls_gcm_auth_decrypt(&g, ctLen, raw.data(), 12, nullptr, 0, raw.data() + 12 + ctLen, 16, raw.data() + 12, plain.data());
+  mbedtls_gcm_free(&g);
+  memset(key, 0, sizeof key);
+  if (r) return false;
+  bool ok = !deserializeJson(out, (const char*)plain.data(), ctLen);
+  std::fill(plain.begin(), plain.end(), 0);
+  return ok;
+}
+
+static String bleInfo() {
+  JsonDocument d;
+  d["op"] = "info"; d["name"] = hubName(); d["mac"] = WiFi.macAddress(); d["id"] = cloudId;
+  d["ver"] = BRIDGE_VERSION; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected();
+  d["nonce"] = b64(bleNonce, sizeof bleNonce);
+  JsonObject w = d["wifi"].to<JsonObject>();
+  w["ssid"] = WiFi.SSID(); w["connected"] = WiFi.status() == WL_CONNECTED;
+  if (WiFi.status() == WL_CONNECTED) { w["ip"] = WiFi.localIP().toString(); w["rssi"] = WiFi.RSSI(); }
+  String s; serializeJson(d, s); return s;
+}
+
+static void bleHandle(const std::string& msg) {
+  JsonDocument d;
+  if (deserializeJson(d, msg)) { bleSend("{\"op\":\"error\",\"reason\":\"bad message\"}"); return; }
+  String op = d["op"] | "";
+  if (op == "info") { bleSend(bleInfo()); return; }
+  if (op == "scan") {
+    int n = WiFi.scanNetworks(false, false);
+    JsonDocument r; r["op"] = "scan";
+    JsonArray a = r["nets"].to<JsonArray>();
+    std::vector<String> seen;
+    for (int i = 0; i < n && a.size() < 20; i++) {
+      String s = WiFi.SSID(i);
+      if (s.isEmpty() || std::find(seen.begin(), seen.end(), s) != seen.end()) continue;   // strongest first
+      seen.push_back(s);
+      JsonObject o = a.add<JsonObject>(); o["s"] = s; o["r"] = WiFi.RSSI(i); o["l"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    }
+    WiFi.scanDelete();
+    String out; serializeJson(r, out); bleSend(out); return;
+  }
+  if (op == "wifi") {
+    JsonDocument cred;
+    if (!openSealed(d["c"] | "", cred)) { bleSend("{\"op\":\"wifi\",\"state\":\"failed\",\"reason\":\"code\"}"); return; }
+    String ssid = cred["ssid"] | "", pw = cred["pw"] | "";
+    if (ssid.isEmpty()) { bleSend("{\"op\":\"wifi\",\"state\":\"failed\",\"reason\":\"no network name\"}"); return; }
+    bleSend("{\"op\":\"wifi\",\"state\":\"connecting\"}");
+    hubEvent("Joining Wi-Fi \"" + ssid + "\" (set up from the app)");
+    WiFi.disconnect(false, false); delay(200);
+    WiFi.persistent(true);
+    WiFi.begin(ssid.c_str(), pw.c_str());
+    pw = ""; cred.clear();
+    uint32_t t0 = millis();
+    wl_status_t st = WL_IDLE_STATUS;
+    while (millis() - t0 < 20000) { st = WiFi.status(); if (st == WL_CONNECTED || st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) break; delay(250); }
+    if (st == WL_CONNECTED) {
+      wifiLostSince = 0;
+      bleSend("{\"op\":\"wifi\",\"state\":\"connected\",\"ip\":\"" + WiFi.localIP().toString() + "\"}");
+      hubEvent("Joined Wi-Fi \"" + ssid + "\"");
+    } else {
+      const char* why = st == WL_NO_SSID_AVAIL ? "network not found" : st == WL_CONNECT_FAILED ? "wrong password" : "no answer";
+      bleSend(String("{\"op\":\"wifi\",\"state\":\"failed\",\"reason\":\"") + why + "\"}");
+      hubEvent(String("Couldn't join Wi-Fi \"") + ssid + "\" (" + why + ")");
+    }
+    return;
+  }
+  if (op == "done") { bleDismissed = true; bleOffAt = millis() + 1500; return; }
+  bleSend("{\"op\":\"error\",\"reason\":\"unknown op\"}");
+}
+
+// Runs the app's requests (a Wi-Fi scan or join takes seconds; never inside the Bluetooth task).
+static void setupTask(void*) {
+  for (;;) {
+    std::string* m = nullptr;
+    if (xQueueReceive(bleQ, &m, pdMS_TO_TICKS(500)) == pdTRUE && m) { bleHandle(*m); delete m; }
+  }
+}
+
+// Called from loop(): Bluetooth on while setup is allowed or the Wi-Fi isn't working, off otherwise.
+static void bleManage() {
+  bool noWifi = WiFi.SSID().isEmpty() || (wifiLostSince && millis() - wifiLostSince > 60000);
+  bool want = (setupAllowed() && !bleDismissed) || noWifi;
+  if (bleOffAt && (int32_t)(millis() - bleOffAt) > 0 && !noWifi) { bleStop(); return; }
+  if (want && !bleOn && (!bleDismissed || noWifi)) bleStart();
+  else if (!want && bleOn && !bleConnected) bleStop();
+}
+
+
 // ---------- setup / loop ----------
 
 static const char* resetName(esp_reset_reason_t r) {
@@ -1093,17 +1313,17 @@ void setup() {
   outQ = xQueueCreate(48, sizeof(Out*));
   hubQ = xQueueCreate(8, sizeof(std::string*));
 
+  // Wi-Fi: the network saved by Bluetooth setup (or by the older setup portal). With none saved, or
+  // one that stops working, Bluetooth setup turns on (bleManage) and the hub keeps trying meanwhile.
+  loadSetupCode();
+  bleQ = xQueueCreate(4, sizeof(std::string*));
+  xTaskCreatePinnedToCore(setupTask, "hgSetup", 8192, nullptr, 1, nullptr, 0);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("homeglow-bridge");
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(600);
-  wm.setTitle("HomeGlow Bridge");
-  led(40, 30, 0);
-  if (!wm.autoConnect("HomeGlow-Bridge")) ESP.restart();
+  WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
-
-  MDNS.begin("homeglow-bridge");
-  MDNS.addService("http", "tcp", 80);
+  led(40, 30, 0);
+  if (!WiFi.SSID().isEmpty()) WiFi.begin();
 
   // The bridge checks the cloud's certificate against Amazon Root CA 1 only, and logs in with its own.
   if (provisioned) {
@@ -1129,14 +1349,26 @@ void setup() {
   xTaskCreatePinnedToCore(statusTask, "hgStatus", 10240, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(hubTask, "hgHub", 24576, nullptr, 1, nullptr, 0);
 
-  if (provisioned) connectCloud(); else led(40, 0, 40);   // purple: needs its cloud login
+  if (!provisioned) led(40, 0, 40);   // purple: needs its cloud login (the cloud connects from loop once Wi-Fi is up)
 }
 
 void loop() {
   web.handleClient();
-  if (WiFi.status() != WL_CONNECTED) { led(40, 30, 0); delay(200); return; }
+  static uint32_t lastBle = 0;
+  if (millis() - lastBle > 1000) { lastBle = millis(); bleManage(); }
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiLostSince) wifiLostSince = millis() | 1;
+    // A saved network that's gone quiet: ask again now and then (setAutoReconnect covers most cases).
+    static uint32_t lastJoin = 0;
+    if (!WiFi.SSID().isEmpty() && millis() - lastJoin > 30000 && millis() - wifiLostSince > 30000) { lastJoin = millis(); WiFi.reconnect(); }
+    if (bleOn) led(0, 25, 40); else led(40, 30, 0);       // cyan: waiting for Bluetooth setup; amber: no Wi-Fi
+    delay(50); return;
+  }
+  wifiLostSince = 0;
+  if (!mdnsUp) { mdnsUp = MDNS.begin("homeglow-bridge"); if (mdnsUp) MDNS.addService("http", "tcp", 80); }
+  if (!provisioned) { static uint32_t lp = 0; if (millis() - lp > 2000) { lp = millis(); led(40, 0, 40); } }
   if (provisioned) {
-    if (!mqtt.connected()) { if (millis() - lastTry > 15000) connectCloud(); }
+    if (!mqtt.connected()) { if (!lastTry || millis() - lastTry > 15000) connectCloud(); }
     else mqtt.loop();
   }
   // Publish what the workers and the status task produced (a few per pass keeps the loop lively).
