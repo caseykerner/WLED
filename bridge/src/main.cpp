@@ -53,7 +53,7 @@ static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.8.1"
+#define BRIDGE_VERSION    "0.9.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -76,6 +76,7 @@ static String setupCode;                  // Bluetooth setup code, from the labe
 struct Controller {
   String login, name, ip, mac;
   bool direct = false;             // holds its own cloud connection: leave it alone
+  bool owned = true;               // this hub looks after it (see "which controllers are this hub's")
   volatile bool online = false;
   volatile bool pollSoon = true;
   uint8_t misses = 0;
@@ -246,10 +247,31 @@ static String loginFor(const String& name) {
 }
 
 // Index of the controller with this login, and its address (copied), or -1.
+// ---------- which controllers are this hub's ----------
+// A hub only looks after the controllers its owner gave it (by hardware address, kept in
+// OWNED_FILE), so two hubs on one network (a second hub, a neighbour on shared Wi-Fi) never both
+// drive the same controller. The others it finds are only listed, so the app can offer them.
+// A hub with no list at all (set up before 0.9) keeps the old behaviour: every controller it finds.
+#define OWNED_FILE "/owned.json"
+static bool ownedListed = false;
+static std::vector<String> ownedMacs;     // guarded by ctrlMx
+static bool isOwnedMac(const String& mac) {            // call with ctrlMx held
+  if (!ownedListed) return true;
+  for (auto& m : ownedMacs) if (m.equalsIgnoreCase(mac)) return true;
+  return false;
+}
+static void loadOwned() {
+  File f = LittleFS.open(OWNED_FILE, "r");
+  if (!f) return;
+  JsonDocument d;
+  if (!deserializeJson(d, f)) { ownedListed = true; for (JsonVariant m : d["macs"].as<JsonArray>()) ownedMacs.push_back(m.as<String>()); }
+  f.close();
+}
+
 static int findCtrl(const String& login, String& ip) {
   int found = -1;
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
-  for (int i = 0; i < nCtrls; i++) if (ctrls[i].login == login && !ctrls[i].direct) { found = i; ip = ctrls[i].ip; break; }
+  for (int i = 0; i < nCtrls; i++) if (ctrls[i].login == login && !ctrls[i].direct && ctrls[i].owned) { found = i; ip = ctrls[i].ip; break; }
   xSemaphoreGive(ctrlMx);
   return found;
 }
@@ -342,6 +364,7 @@ static void scan() {
     }
     if (idx >= 0) {
       ctrls[idx].ip = ip; ctrls[idx].name = name; ctrls[idx].login = loginFor(name); ctrls[idx].direct = direct;
+      ctrls[idx].owned = isOwnedMac(mac);
     }
     xSemaphoreGive(ctrlMx);
     Serial.printf("[scan] %s %s%s\n", ip.c_str(), name.c_str(), direct ? " (own cloud link: skipped)" : "");
@@ -481,12 +504,15 @@ static void publishStats() {
   d["connects"] = (uint32_t)connects; d["plays"] = (uint32_t)playsDone; d["resends"] = (uint32_t)resendsDone;
   uint32_t n = tunDone; d["requests"] = n; d["avgMs"] = n ? (uint32_t)(tunMsTotal / n) : 0;
   JsonArray cs = d["controllers"].to<JsonArray>();
+  JsonArray found = d["found"].to<JsonArray>();      // on the network, but not this hub's
   JsonArray ev = d["events"].to<JsonArray>();
+  d["listed"] = ownedListed;
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
   for (int i = 0; i < nCtrls; i++) {
     Controller& c = ctrls[i];
+    if (!c.owned) { JsonObject o = found.add<JsonObject>(); o["name"] = c.name; o["mac"] = c.mac; o["ip"] = c.ip; continue; }
     JsonObject o = cs.add<JsonObject>();
-    o["login"] = c.login; o["name"] = c.name; o["ip"] = c.ip; o["online"] = (bool)c.online; o["direct"] = c.direct;
+    o["login"] = c.login; o["name"] = c.name; o["ip"] = c.ip; o["online"] = (bool)c.online; o["direct"] = c.direct; o["mac"] = c.mac;
     if (c.desiredAt) { o["holding"] = (now - c.desiredAt) / 1000; o["confirmed"] = c.desiredOk; o["resends"] = c.desiredTries; }
   }
   for (int i = (int)hubEvents.size() - 1; i >= 0; i--) {
@@ -505,8 +531,9 @@ static void statusTask(void*) {
       if (millis() - lastScan > SCAN_EVERY_MS || nCtrls == 0) scan();
       // Asked-for checks (after a change) first, then whatever is due.
       int pick = -1;
-      for (int i = 0; i < nCtrls && pick < 0; i++) if (ctrls[i].pollSoon) pick = i;
+      for (int i = 0; i < nCtrls && pick < 0; i++) if (ctrls[i].owned && ctrls[i].pollSoon) pick = i;
       for (int i = 0; i < nCtrls && pick < 0; i++) {
+        if (!ctrls[i].owned) continue;
         uint32_t every = ctrls[i].direct ? INFO_EVERY_MS : (ctrls[i].online ? STATE_EVERY_MS : OFFLINE_EVERY_MS);
         if (millis() - ctrls[i].lastPoll > every) pick = i;
       }
@@ -613,6 +640,31 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
     statsDirty = true;
     Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + String((const char*)(h["c"] | ""))).c_str();
     o->id = (const char*)(h["id"] | ""); o->status = 200; o->ct = "application/json"; o->payload = "{\"unlocked\":600}";
+    post(o);
+    return nullptr;
+  }
+  // The owner's list of this hub's controllers, from the app (only through AWS): {"own":[mac,…]}.
+  if (h["own"].is<JsonArray>() && !(h["local"] | false)) {
+    JsonDocument keep; JsonArray macs = keep["macs"].to<JsonArray>();
+    xSemaphoreTake(ctrlMx, portMAX_DELAY);
+    ownedMacs.clear(); ownedListed = true;
+    for (JsonVariant m : h["own"].as<JsonArray>()) { String mac = m.as<String>(); if (mac.length() && ownedMacs.size() < MAX_CTRLS) { ownedMacs.push_back(mac); macs.add(mac); } }
+    int mine = 0;
+    for (int i = 0; i < nCtrls; i++) {
+      bool was = ctrls[i].owned;
+      ctrls[i].owned = isOwnedMac(ctrls[i].mac);
+      if (ctrls[i].owned) { mine++; if (!was) { ctrls[i].pollSoon = true; ctrls[i].stateHash = 0; } }
+      else { ctrls[i].online = false; ctrls[i].desiredAt = 0; }
+    }
+    xSemaphoreGive(ctrlMx);
+    File f = LittleFS.open(OWNED_FILE, "w");
+    bool saved = false;
+    if (f) { saved = serializeJson(keep, f) > 0; f.close(); }
+    hubEvent(String("This hub now looks after ") + String((int)ownedMacs.size()) + (ownedMacs.size() == 1 ? " controller" : " controllers"));
+    statsDirty = true;
+    Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + String((const char*)(h["c"] | ""))).c_str();
+    o->id = (const char*)(h["id"] | ""); o->status = saved ? 200 : 500; o->ct = "application/json";
+    o->payload = "{\"owned\":" + std::to_string(ownedMacs.size()) + ",\"here\":" + std::to_string(mine) + "}";
     post(o);
     return nullptr;
   }
@@ -998,7 +1050,7 @@ static void webStatusJson() {
   d["connects"] = (uint32_t)connects; d["in"] = (uint32_t)cmdsIn; d["sent"] = (uint32_t)cmdsSent; d["refused"] = (uint32_t)cmdsRefused;
   d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
   d["internal"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL); d["largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-  d["lowMem"] = lowMemory(); d["updates"] = setupAllowed();
+  d["lowMem"] = lowMemory(); d["updates"] = setupAllowed(); d["listed"] = ownedListed;
   uint32_t n = tunDone;
   d["tunnel"] = n; d["tunnelRefused"] = (uint32_t)tunRefused; d["shortWrites"] = (uint32_t)shortWrites;
   d["avgMs"] = n ? (uint32_t)(tunMsTotal / n) : 0; d["avgWledMs"] = n ? (uint32_t)(wledMsTotal / n) : 0;
@@ -1015,6 +1067,7 @@ static void webStatusJson() {
     Controller& c = ctrls[i];
     JsonObject o = a.add<JsonObject>();
     o["name"] = c.name; o["ip"] = c.ip; o["login"] = c.login; o["online"] = (bool)c.online; o["direct"] = c.direct;
+    o["mac"] = c.mac; o["owned"] = c.owned;
     if (c.desiredAt) { o["holding"] = (millis() - c.desiredAt) / 1000; o["playing"] = c.desiredOk; o["resends"] = c.desiredTries; }
   }
   xSemaphoreGive(ctrlMx);
@@ -1323,6 +1376,7 @@ void setup() {
   led(0, 0, 40);
   LittleFS.begin(true);
   provisioned = loadCloud();
+  loadOwned();
   stateTopicSelf = String("hg/") + (cloudId.length() ? cloudId : String("bridge")) + "/state";
   ctrlMx = xSemaphoreCreateMutex();
   jobQ = xQueueCreate(32, sizeof(Job*));
