@@ -65,7 +65,7 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.10.0"
+#define BRIDGE_VERSION    "0.10.1"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -706,6 +706,39 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
     statsDirty = true;
     Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + String((const char*)(h["c"] | ""))).c_str();
     o->id = (const char*)(h["id"] | ""); o->status = 200; o->ct = "application/json"; o->payload = "{\"unlocked\":600}";
+    post(o);
+    return nullptr;
+  }
+  // Controllers the app already knows (only through AWS): {"meet":[{"mac","ip","name"},…]}. Asking
+  // the network who is there (scan) misses some controllers each time and all that are powered
+  // off; the app has had every one of them on its list since the day it was added.
+  if (h["meet"].is<JsonArray>() && !(h["local"] | false)) {
+    int met = 0;
+    xSemaphoreTake(ctrlMx, portMAX_DELAY);
+    for (JsonObject m : h["meet"].as<JsonArray>()) {
+      String mac = m["mac"] | "", ip = m["ip"] | "", name = m["name"] | "WLED";
+      mac.toLowerCase(); mac.replace(":", "");
+      if (mac.length() != 12 || ip.isEmpty()) continue;
+      int idx = -1;
+      for (int k = 0; k < nCtrls; k++) if (ctrls[k].mac.equalsIgnoreCase(mac)) idx = k;
+      if (idx < 0 && nCtrls < MAX_CTRLS) {
+        idx = nCtrls;
+        Controller& c = ctrls[idx];
+        c.mac = mac; c.ip = ip; c.name = name; c.login = loginFor(name, mac);
+        c.owned = isOwnedMac(mac); c.online = false; c.pollSoon = true;
+        if (!c.lock) c.lock = xSemaphoreCreateMutex();
+        nCtrls = nCtrls + 1;
+        met++; knownDirty = true;
+      } else if (idx >= 0 && !ctrls[idx].online && ctrls[idx].ip != ip) {
+        ctrls[idx].ip = ip; ctrls[idx].pollSoon = true; knownDirty = true;     // it moved while the hub couldn't see it
+      }
+    }
+    xSemaphoreGive(ctrlMx);
+    if (met) hubEvent(String("Learned ") + met + (met == 1 ? " controller" : " controllers") + " from the app");
+    statsDirty = true;
+    Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + String((const char*)(h["c"] | ""))).c_str();
+    o->id = (const char*)(h["id"] | ""); o->status = 200; o->ct = "application/json";
+    o->payload = "{\"met\":" + std::to_string(met) + "}";
     post(o);
     return nullptr;
   }
