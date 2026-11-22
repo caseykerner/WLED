@@ -53,7 +53,7 @@ static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.9.0"
+#define BRIDGE_VERSION    "0.9.1"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -1162,7 +1162,6 @@ static String savedSsid() {
 }
 static uint32_t wifiLostSince = 0;        // millis() since the saved Wi-Fi stopped working (0 = fine)
 static bool mdnsUp = false;
-static bool bleDismissed = false;         // the app said "done": stay off until the Wi-Fi breaks or the hub restarts
 
 static void loadSetupCode() {
   File f = LittleFS.open(SETUP_FILE, "r");
@@ -1233,15 +1232,6 @@ static void bleStart() {
   a->start();
   bleOn = true; bleOffAt = 0;
   hubEvent("Bluetooth setup is on");
-}
-
-static void bleStop() {
-  if (!bleOn) return;
-  bleEvt = nullptr; bleConnected = false;
-  NimBLEDevice::deinit(true);             // gives Bluetooth's memory back
-  WiFi.setSleep(false);                   // full-speed Wi-Fi again (quicker answers to the controllers)
-  bleOn = false; bleOffAt = 0;
-  hubEvent("Bluetooth setup is off");
 }
 
 static String b64(const uint8_t* p, size_t n) {
@@ -1329,7 +1319,7 @@ static void bleHandle(const std::string& msg) {
     }
     return;
   }
-  if (op == "done") { bleDismissed = true; bleOffAt = millis() + 1500; return; }
+  if (op == "done") { bleOffAt = millis() + 1500; return; }
   bleSend("{\"op\":\"error\",\"reason\":\"unknown op\"}");
 }
 
@@ -1341,13 +1331,21 @@ static void setupTask(void*) {
   }
 }
 
-// Called from loop(): Bluetooth on while setup is allowed or the Wi-Fi isn't working, off otherwise.
+// Called from loop(). Bluetooth setup is on only while the hub has no Wi-Fi that works (nothing
+// saved, or the saved network has been unreachable for a minute); the setup code still guards it.
+// Once setup is finished the hub restarts rather than switching Bluetooth off in place: after the
+// Bluetooth radio is shut down the Wi-Fi was left unable to complete the cloud's TLS handshake
+// (0.9.0), and a restart brings it up clean with Bluetooth never started.
 static void bleManage() {
   bool noWifi = savedSsid().isEmpty() || (wifiLostSince && millis() - wifiLostSince > 60000);
-  bool want = (setupAllowed() && !bleDismissed) || noWifi;
-  if (bleOffAt && (int32_t)(millis() - bleOffAt) > 0 && !noWifi) { bleStop(); return; }
-  if (want && !bleOn && (!bleDismissed || noWifi)) bleStart();
-  else if (!want && bleOn && !bleConnected) bleStop();
+  if (!bleOn) { if (noWifi) bleStart(); return; }
+  bool finished = bleOffAt && (int32_t)(millis() - bleOffAt) > 0;        // the app said "done"
+  bool idle = !noWifi && !bleConnected && !bleOffAt;                      // Wi-Fi works and no phone is connected
+  if (finished || idle) {
+    Serial.println("[setup] finished: restarting");
+    delay(300);
+    ESP.restart();
+  }
 }
 
 
@@ -1439,7 +1437,7 @@ void loop() {
   if (!mdnsUp) { mdnsUp = MDNS.begin("homeglow-bridge"); if (mdnsUp) MDNS.addService("http", "tcp", 80); }
   if (!provisioned) { static uint32_t lp = 0; if (millis() - lp > 2000) { lp = millis(); led(40, 0, 40); } }
   if (provisioned) {
-    if (!mqtt.connected()) { if (!lastTry || millis() - lastTry > 15000) connectCloud(); }
+    if (!mqtt.connected()) { if (!bleOn && (!lastTry || millis() - lastTry > 15000)) connectCloud(); }
     else mqtt.loop();
   }
   // Publish what the workers and the status task produced (a few per pass keeps the loop lively).
