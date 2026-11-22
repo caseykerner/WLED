@@ -1151,6 +1151,9 @@ class BleCmdCB : public NimBLECharacteristicCallbacks {
 
 static void bleStart() {
   if (bleOn) return;
+  // Wi-Fi and Bluetooth share the radio: the chip refuses (aborts) to start Bluetooth while Wi-Fi
+  // power saving is off, so it's back on while Bluetooth runs.
+  WiFi.setSleep(true);
   NimBLEDevice::init(hubName().c_str());
   NimBLEDevice::setMTU(247);
   NimBLEServer* s = NimBLEDevice::createServer();
@@ -1171,6 +1174,7 @@ static void bleStop() {
   if (!bleOn) return;
   bleEvt = nullptr; bleConnected = false;
   NimBLEDevice::deinit(true);             // gives Bluetooth's memory back
+  WiFi.setSleep(false);                   // full-speed Wi-Fi again (quicker answers to the controllers)
   bleOn = false; bleOffAt = 0;
   hubEvent("Bluetooth setup is off");
 }
