@@ -45,7 +45,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.3.2"
+#define BRIDGE_VERSION    "0.3.3"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -100,6 +100,7 @@ struct TunReq {
 static std::vector<TunReq> tunIn;          // still collecting parts (main task only)
 static std::vector<String> tunRefusedLog;  // last few refused requests, for the status page
 static std::vector<String> tunRecent;      // last few requests (method, controller, path, ms, size)
+static std::vector<String> appLog;         // HomeGlow Dev's timeline lines (hg/applog/cmd), main task only
 
 // Work for the worker tasks.
 struct Job { bool tunnel; TunReq req; String login, body; };
@@ -383,6 +384,17 @@ static void onTunnel(const String& login, uint8_t* payload, unsigned int len) {
 static void onMessage(char* topic, uint8_t* payload, unsigned int len) {
   String t(topic);
   if (t.startsWith("hg/req/")) { onTunnel(t.substring(7), payload, len); return; }
+  if (t == "hg/applog/cmd") {                // the app's diagnostics timeline, for /log
+    String all((const char*)payload, len);
+    int from = 0;
+    while (from < (int)all.length()) {
+      int nl = all.indexOf('\n', from); if (nl < 0) nl = all.length();
+      appLog.push_back(String(millis() / 1000) + " | " + all.substring(from, nl));
+      from = nl + 1;
+    }
+    while (appLog.size() > 400) appLog.erase(appLog.begin());
+    return;
+  }
   cmdsIn++;
   int a = t.indexOf('/'), b = t.lastIndexOf('/');    // hg/<login>/cmd
   if (a < 0 || b <= a || len == 0 || len > MAX_CMD) { cmdsRefused++; return; }
@@ -491,7 +503,7 @@ static void runTunnel(TunReq& r) {
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
   tunRecent.push_back(String(millis() / 1000) + "s " + r.method + " " + r.login + r.path.substring(0, 60) + " " + String(ms) + "ms " +
                       String((uint32_t)o->payload.size()) + (o->zip ? "z" : "") + (r.zip ? "" : " noz"));
-  if (tunRecent.size() > 40) tunRecent.erase(tunRecent.begin());
+  if (tunRecent.size() > 150) tunRecent.erase(tunRecent.begin());
   xSemaphoreGive(ctrlMx);
   tunMsTotal += ms; wledMsTotal += wledMs; waitMsTotal += wait;
   if (ms > tunMsMax) tunMsMax = ms;
@@ -603,6 +615,18 @@ static void webUpdateChunk() {
   else if (u.status == UPLOAD_FILE_END) Update.end(true);
 }
 
+
+// Plain-text timeline: the app's lines (hub seconds | app seconds since launch) and the hub's requests.
+static void webLog() {
+  String out = "== app timeline (hub uptime s | app s since launch) ==\n";
+  for (auto& x : appLog) { out += x; out += '\n'; }
+  out += "\n== hub requests ==\n";
+  xSemaphoreTake(ctrlMx, portMAX_DELAY);
+  for (auto& x : tunRecent) { out += x; out += '\n'; }
+  xSemaphoreGive(ctrlMx);
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  web.send(200, "text/plain", out);
+}
 
 static void webStatusJson() {
   JsonDocument d;
@@ -719,6 +743,7 @@ void setup() {
 
   web.on("/", webRoot);
   web.on("/json", webStatusJson);
+  web.on("/log", webLog);
   web.on("/update", HTTP_POST, webUpdateDone, webUpdateChunk);
   web.on("/provision", HTTP_POST, webProvision);
   web.on("/provision", HTTP_OPTIONS, webCors);
