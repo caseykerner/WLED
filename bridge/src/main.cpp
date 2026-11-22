@@ -46,7 +46,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.4.0"
+#define BRIDGE_VERSION    "0.4.1"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -98,6 +98,10 @@ static std::atomic<uint32_t> tunMsTotal{0}, tunMsMax{0}, wledMsTotal{0}, waitMsT
 static int lastMqttErr = 0;
 static String stateTopicSelf;
 static const char* resetReason = "unknown";
+// Where the hub was when it last crashed (kept through the restart), for /json.
+RTC_NOINIT_ATTR static uint32_t crashStage;
+static uint32_t lastCrashStage = 0;
+#define STAGE(n) (crashStage = (n))
 
 // A tunnelled HTTP request, collected from its parts.
 struct TunReq {
@@ -313,6 +317,7 @@ static bool enqueuePlay(const String& login, const std::string& look, std::share
 // Stops checking when a saved preset takes over (a schedule, Autopilot, a button) or after 10 min.
 static void checkDesired(Controller& c, const String& login, const std::string& state, bool cameOnline) {
   if (!c.desiredAt) return;
+  STAGE(401);
   uint32_t now = millis();
   if (now - c.desiredAt > DESIRED_MS) { c.desiredAt = 0; c.desiredBody.clear(); return; }
   if (c.desiredSig.isEmpty()) return;
@@ -322,7 +327,9 @@ static void checkDesired(Controller& c, const String& login, const std::string& 
   if (deserializeJson(d, state, DeserializationOption::Filter(f))) return;
   bool restarted = cameOnline && c.onlineSince > c.desiredAt;
   if (!restarted && (d["ps"] | -1) > 0) { c.desiredAt = 0; c.desiredBody.clear(); return; }   // a preset took over
+  STAGE(402);
   String sig = lookSig(d["seg"].as<JsonArrayConst>());
+  STAGE(403);
   if (sig == c.desiredSig) { c.desiredOk = true; return; }
   bool on = d["on"] | false;
   if ((on || restarted) && c.desiredTries < DESIRED_TRIES) {
@@ -473,6 +480,7 @@ static void onTunnel(const String& login, uint8_t* payload, unsigned int len) {
 }
 
 static void postBatchReply(std::shared_ptr<Batch> b) {
+  STAGE(302);
   Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + b->reply).c_str(); o->id = b->id; o->status = 200;
   o->ct = "application/json";
   o->payload = b->results;
@@ -483,6 +491,7 @@ static void postBatchReply(std::shared_ptr<Batch> b) {
 
 static void batchDone(std::shared_ptr<Batch> b, const String& login, int code) {
   if (!b) return;
+  STAGE(301);
   xSemaphoreTake(b->mx, portMAX_DELAY);
   b->results += "\"" + std::string(login.c_str()) + "\":" + std::to_string(code) + ",";
   bool last = --b->pending <= 0;
@@ -495,11 +504,13 @@ static void batchDone(std::shared_ptr<Batch> b, const String& login, int code) {
 // Each controller gets its own look over the home network, all at the same time; the app gets
 // one answer with every controller's result. Each look is remembered and checked (checkDesired).
 static void onHubCommand(uint8_t* payload, unsigned int len) {
+  STAGE(101);
   unsigned int nl = 0;
   while (nl < len && payload[nl] != '\n') nl++;
   if (nl >= len) { cmdsRefused++; return; }
   JsonDocument h;
   if (deserializeJson(h, (const char*)payload, nl)) { cmdsRefused++; return; }
+  STAGE(102);
   auto b = std::make_shared<Batch>();
   b->id = h["id"] | ""; b->reply = h["c"] | ""; b->started = millis(); b->mx = xSemaphoreCreateMutex();
   const uint8_t* body = payload + nl + 1; size_t blen = len - nl - 1;
@@ -512,6 +523,7 @@ static void onHubCommand(uint8_t* payload, unsigned int len) {
     tinfl_decompressor* d = (tinfl_decompressor*)ps_malloc(sizeof(tinfl_decompressor));
     if (!d) { free(plain); cmdsRefused++; return; }
     tinfl_init(d);
+    STAGE(103);
     size_t inBytes = blen, n = cap;
     tinfl_status st = tinfl_decompress(d, body, &inBytes, (mz_uint8*)plain, (mz_uint8*)plain, &n,
                                        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
@@ -519,19 +531,23 @@ static void onHubCommand(uint8_t* payload, unsigned int len) {
     if (st != TINFL_STATUS_DONE) { free(plain); cmdsRefused++; return; }
     plen = n;
   }
+  STAGE(104);
   JsonDocument doc(&spiAlloc);
   DeserializationError e = deserializeJson(doc, plain ? (const char*)plain : (const char*)body, plen);
+  STAGE(105);
   if (plain) free(plain);
   if (e) { cmdsRefused++; return; }
   JsonArray jobs = doc["jobs"].as<JsonArray>();
   b->pending = jobs.size();
   if (b->pending == 0) { postBatchReply(b); return; }
   for (JsonObject job : jobs) {
+    STAGE(106);
     String login = job["c"] | "";
     String ip;
     int idx = findCtrl(login, ip);
     if (idx < 0 || ip.isEmpty()) { batchDone(b, login, 404); continue; }
     std::string look; serializeJson(job["b"], look);
+    STAGE(107);
     String sig = job["b"]["seg"].is<JsonArray>() ? lookSig(job["b"]["seg"].as<JsonArrayConst>()) : String("");
     Controller& c = ctrls[idx];
     xSemaphoreTake(ctrlMx, portMAX_DELAY);
@@ -539,8 +555,10 @@ static void onHubCommand(uint8_t* payload, unsigned int len) {
     else { c.desiredAt = 0; c.desiredBody.clear(); }      // on/off or brightness only: nothing to keep checking
     xSemaphoreGive(ctrlMx);
     cmdsIn++;
+    STAGE(108);
     if (!enqueuePlay(login, look, b)) batchDone(b, login, 503);
   }
+  STAGE(109);
 }
 
 static void onMessage(char* topic, uint8_t* payload, unsigned int len) {
@@ -679,6 +697,7 @@ static void runTunnel(TunReq& r) {
 
 // Hub as master: one controller's look from a batch (or a resend), sent over the home network.
 static void runPlay(Job& j) {
+  STAGE(201);
   String ip;
   int idx = findCtrl(j.login, ip);
   if (idx < 0 || ip.isEmpty()) { cmdsRefused++; batchDone(j.batch, j.login, 404); return; }
@@ -689,6 +708,7 @@ static void runPlay(Job& j) {
     code = wledRequest(ip, "POST", "/json/state", j.look, "application/json", out, nullptr, 3000, 8000);
     xSemaphoreGive(ctrls[idx].lock);
   }
+  STAGE(202);
   if (code == 200) cmdsSent++; else cmdsRefused++;
   ctrls[idx].pollSoon = true;              // check it took, and tell the app
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
@@ -696,7 +716,9 @@ static void runPlay(Job& j) {
                       String((uint32_t)j.look.size()) + "b" + (j.batch ? "" : " (resend)"));
   if (tunRecent.size() > 150) tunRecent.erase(tunRecent.begin());
   xSemaphoreGive(ctrlMx);
+  STAGE(203);
   batchDone(j.batch, j.login, code > 0 ? code : 504);
+  STAGE(204);
 }
 
 static void workerTask(void*) {
@@ -817,10 +839,18 @@ static void webLog() {
   web.send(200, "text/plain", out);
 }
 
+// Local test of a hub command (same body as hg/<hub>/cmd), from the home network only.
+static void webPlay() {
+  String body = web.arg("plain");
+  onHubCommand((uint8_t*)body.c_str(), body.length());
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  web.send(200, "text/plain", "queued");
+}
+
 static void webStatusJson() {
   JsonDocument d;
   d["ver"] = BRIDGE_VERSION; d["id"] = cloudId; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected(); d["err"] = lastMqttErr;
-  d["reset"] = resetReason;
+  d["reset"] = resetReason; d["crashStage"] = lastCrashStage;
   d["connects"] = (uint32_t)connects; d["in"] = (uint32_t)cmdsIn; d["sent"] = (uint32_t)cmdsSent; d["refused"] = (uint32_t)cmdsRefused;
   d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
   uint32_t n = tunDone;
@@ -901,6 +931,8 @@ static const char* resetName(esp_reset_reason_t r) {
 void setup() {
   Serial.begin(115200);
   resetReason = resetName(esp_reset_reason());
+  if (esp_reset_reason() == ESP_RST_PANIC || esp_reset_reason() == ESP_RST_TASK_WDT || esp_reset_reason() == ESP_RST_INT_WDT) lastCrashStage = crashStage;
+  crashStage = 0;
   led(0, 0, 40);
   LittleFS.begin(true);
   provisioned = loadCloud();
@@ -934,6 +966,7 @@ void setup() {
   web.on("/", webRoot);
   web.on("/json", webStatusJson);
   web.on("/log", webLog);
+  web.on("/play", HTTP_POST, webPlay);
   web.on("/update", HTTP_POST, webUpdateDone, webUpdateChunk);
   web.on("/provision", HTTP_POST, webProvision);
   web.on("/provision", HTTP_OPTIONS, webCors);
