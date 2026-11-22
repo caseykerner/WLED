@@ -46,7 +46,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.4.4"
+#define BRIDGE_VERSION    "0.5.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -115,6 +115,18 @@ static std::vector<TunReq> tunIn;          // still collecting parts (main task 
 static std::vector<String> tunRefusedLog;  // last few refused requests, for the status page
 static std::vector<String> tunRecent;      // last few requests (method, controller, path, ms, size)
 static std::vector<String> appLog;         // HomeGlow Dev's timeline lines (hg/applog/cmd), main task only
+// The hub's own story for the app's Hub page: plain-language events (guarded by ctrlMx).
+struct HubEvent { uint32_t at; String text; };
+static std::vector<HubEvent> hubEvents;
+static std::atomic<uint32_t> playsDone{0}, resendsDone{0};
+static volatile bool statsDirty = true;
+static void hubEvent(const String& text) {
+  xSemaphoreTake(ctrlMx, portMAX_DELAY);
+  hubEvents.push_back({millis(), text});
+  if (hubEvents.size() > 20) hubEvents.erase(hubEvents.begin());
+  xSemaphoreGive(ctrlMx);
+  statsDirty = true;
+}
 
 // Work for the worker tasks.
 struct Batch;
@@ -337,6 +349,8 @@ static void checkDesired(Controller& c, const String& login, const std::string& 
     std::string look;
     xSemaphoreTake(ctrlMx, portMAX_DELAY); look = c.desiredBody; xSemaphoreGive(ctrlMx);
     if (enqueuePlay(login, look, nullptr)) {
+      resendsDone++;
+      hubEvent("Sent the look to " + c.name + " again (" + (restarted ? "it came online after the look went out" : "it wasn't playing it") + ")");
       xSemaphoreTake(ctrlMx, portMAX_DELAY);
       tunRecent.push_back(String(now / 1000) + "s RESEND " + login + (restarted ? " (came online late)" : " (not playing it)") +
                           " try " + String(c.desiredTries));
@@ -376,6 +390,7 @@ static void poll(int i) {
       Out* o = new Out; o->topic = ("hg/" + login + "/state").c_str();
       o->payload = "{\"online\":false,\"via\":\"bridge\"}"; o->retained = true; post(o);
       Serial.printf("[poll] %s offline\n", login.c_str());
+      hubEvent(c.name + " stopped answering");
     }
     return;
   }
@@ -413,7 +428,39 @@ static void poll(int i) {
     Out* o = new Out; o->topic = ("hg/" + login + "/state").c_str(); o->retained = true;
     serializeJson(s, o->payload); post(o); c.lastSmall = now;
   }
-  if (!was) Serial.printf("[poll] %s online\n", login.c_str());
+  if (!was) { Serial.printf("[poll] %s online\n", login.c_str()); hubEvent(c.name + " is online"); }
+}
+
+// The hub's page in the app: hub health, what it's doing, and each controller's check, published
+// (retained) on hg/<hub>/full every 30 s and soon after anything happens.
+static uint32_t lastStats = 0;
+static void publishStats() {
+  lastStats = millis(); statsDirty = false;
+  if (!cloudId.length()) return;
+  JsonDocument d(&spiAlloc);
+  uint32_t now = millis();
+  d["hub"] = true; d["ver"] = BRIDGE_VERSION; d["up"] = now / 1000; d["reset"] = resetReason;
+  d["crashStage"] = lastCrashStage; d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap();
+  d["psram"] = ESP.getFreePsram(); d["rssi"] = WiFi.RSSI(); d["ip"] = WiFi.localIP().toString();
+  d["connects"] = (uint32_t)connects; d["plays"] = (uint32_t)playsDone; d["resends"] = (uint32_t)resendsDone;
+  uint32_t n = tunDone; d["requests"] = n; d["avgMs"] = n ? (uint32_t)(tunMsTotal / n) : 0;
+  JsonArray cs = d["controllers"].to<JsonArray>();
+  JsonArray ev = d["events"].to<JsonArray>();
+  xSemaphoreTake(ctrlMx, portMAX_DELAY);
+  for (int i = 0; i < nCtrls; i++) {
+    Controller& c = ctrls[i];
+    JsonObject o = cs.add<JsonObject>();
+    o["login"] = c.login; o["name"] = c.name; o["ip"] = c.ip; o["online"] = (bool)c.online; o["direct"] = c.direct;
+    if (c.desiredAt) { o["holding"] = (now - c.desiredAt) / 1000; o["confirmed"] = c.desiredOk; o["resends"] = c.desiredTries; }
+  }
+  for (int i = (int)hubEvents.size() - 1; i >= 0; i--) {
+    JsonObject e = ev.add<JsonObject>();
+    e["ago"] = (now - hubEvents[i].at) / 1000; e["text"] = hubEvents[i].text;
+  }
+  xSemaphoreGive(ctrlMx);
+  Out* o = new Out; o->topic = ("hg/" + cloudId + "/full").c_str(); o->retained = true;
+  serializeJson(d, o->payload);
+  post(o);
 }
 
 static void statusTask(void*) {
@@ -427,6 +474,7 @@ static void statusTask(void*) {
         uint32_t every = ctrls[i].direct ? INFO_EVERY_MS : (ctrls[i].online ? STATE_EVERY_MS : OFFLINE_EVERY_MS);
         if (millis() - ctrls[i].lastPoll > every) pick = i;
       }
+      if (millis() - lastStats > 30000 || (statsDirty && millis() - lastStats > 3000)) publishStats();
       if (pick >= 0) { poll(pick); delay(5); continue; }
     }
     delay(50);
@@ -481,6 +529,11 @@ static void onTunnel(const String& login, uint8_t* payload, unsigned int len) {
 
 static void postBatchReply(std::shared_ptr<Batch> b) {
   STAGE(302);
+  playsDone++;
+  int n = std::count(b->results.begin(), b->results.end(), ':');
+  int ok = 0; for (size_t p = b->results.find(":200"); p != std::string::npos; p = b->results.find(":200", p + 1)) ok++;
+  hubEvent(String("Look sent to ") + String(n) + (n == 1 ? " controller" : " controllers") + " in " + String(millis() - b->started) + " ms" +
+           (ok < n ? " (" + String(n - ok) + " didn't answer)" : ""));
   Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + b->reply).c_str(); o->id = b->id; o->status = 200;
   o->ct = "application/json";
   o->payload = b->results;
