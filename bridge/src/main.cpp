@@ -35,6 +35,8 @@
 #include <mbedtls/gcm.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
+#include <mbedtls/pkcs5.h>
+#include <mbedtls/md.h>
 #include <LittleFS.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -50,10 +52,20 @@
 // Cloud login, loaded onto each bridge after flashing (POST /provision from the home network),
 // kept in /cloud.json. The firmware file itself holds no secrets.
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
+// A home of its own in the cloud (0.10). Each home's hub and phones hold certificates that AWS only
+// lets use topics under hg/<home>/, so one home can never see or drive another's lights:
+//   hg/<home>/<controller>/state|full   controller = its hardware address, so names can't clash
+//   hg/<home>/hub/full|cmd|state        the hub itself
+//   hg/<home>/req/<controller>, hg/<home>/resp/<client>, hg/<home>/applog/cmd
+// A hub set up before this (no "home" in its cloud login) keeps the first layout: hg/<name>/…,
+// hg/<hub id>/…, hg/req/…, with the controller's name deciding <name>.
+static String cloudHome;                  // "" = first layout
+static String tb = "hg/";                 // topic base: "hg/" or "hg/<home>/"
+static String hubKey;                     // the hub's own topic part: its id, or "hub" in a home
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.9.3"
+#define BRIDGE_VERSION    "0.10.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -234,7 +246,13 @@ static uint32_t fnv(const std::string& s) {
 }
 
 // The same names the app uses for its cloud logins.
-static String loginFor(const String& name) {
+static String nameLogin(const String& name);
+// The controller's part of its topics: its hardware address in a home, else from its name.
+static String loginFor(const String& name, const String& mac) {
+  if (cloudHome.length() && mac.length()) { String m = mac; m.toLowerCase(); m.replace(":", ""); return m; }
+  return nameLogin(name);
+}
+static String nameLogin(const String& name) {
   String n = name; n.toLowerCase();
   if (n.indexOf("house") >= 0) return "house";
   if (n.indexOf("beer") >= 0) return "beerfridge";
@@ -282,7 +300,7 @@ static void loadKnown() {
       String mac = k["mac"] | "", ip = k["ip"] | "";
       if (mac.isEmpty() || ip.isEmpty() || nCtrls >= MAX_CTRLS) continue;
       Controller& c = ctrls[nCtrls];
-      c.mac = mac; c.ip = ip; c.name = k["name"] | "WLED"; c.login = loginFor(c.name);
+      c.mac = mac; c.ip = ip; c.name = k["name"] | "WLED"; c.login = loginFor(c.name, mac);
       c.owned = isOwnedMac(mac);
       c.lock = xSemaphoreCreateMutex();
       // Taken as online until a check says otherwise, so one that's off gets reported as such.
@@ -407,7 +425,7 @@ static void scan() {
     }
     if (idx >= 0) {
       if (ctrls[idx].ip != ip || ctrls[idx].name != name) knownDirty = true;
-      ctrls[idx].ip = ip; ctrls[idx].name = name; ctrls[idx].login = loginFor(name); ctrls[idx].direct = direct;
+      ctrls[idx].ip = ip; ctrls[idx].name = name; ctrls[idx].login = loginFor(name, mac); ctrls[idx].direct = direct;
       ctrls[idx].owned = isOwnedMac(mac);
     }
     xSemaphoreGive(ctrlMx);
@@ -485,7 +503,7 @@ static void poll(int i) {
   if (code != 200) {
     if (++c.misses >= 2 && c.online) {
       c.online = false;
-      Out* o = new Out; o->topic = ("hg/" + login + "/state").c_str();
+      Out* o = new Out; o->topic = (tb + login + "/state").c_str();
       o->payload = "{\"online\":false,\"via\":\"bridge\"}"; o->retained = true; post(o);
       Serial.printf("[poll] %s offline\n", login.c_str());
       hubEvent(c.name + " stopped answering");
@@ -507,7 +525,7 @@ static void poll(int i) {
   c.stateHash = h;
   uint32_t now = millis();
   if (changed || infoDue || now - c.lastFull > HEARTBEAT_MS) {
-    Out* o = new Out; o->topic = ("hg/" + login + "/full").c_str(); o->retained = true;
+    Out* o = new Out; o->topic = (tb + login + "/full").c_str(); o->retained = true;
     o->payload.reserve(state.size() + c.info.size() + 40);
     o->payload = "{\"state\":"; o->payload += state;
     o->payload += ",\"info\":"; o->payload += c.info.empty() ? "{}" : c.info;
@@ -520,10 +538,10 @@ static void poll(int i) {
     JsonDocument fi; fi["freeheap"] = true; fi["uptime"] = true; fi["ver"] = true;
     JsonDocument in; deserializeJson(in, c.info, DeserializationOption::Filter(fi));
     JsonDocument s;
-    s["online"] = true; s["via"] = "bridge"; s["hub"] = cloudId;
+    s["online"] = true; s["via"] = "bridge"; s["hub"] = hubKey;
     s["on"] = st["on"] | false; s["bri"] = st["bri"] | 0; s["ps"] = st["ps"] | -1; s["pl"] = st["pl"] | -1;
     s["heap"] = in["freeheap"] | 0; s["up"] = in["uptime"] | 0; s["ver"] = in["ver"] | "";
-    Out* o = new Out; o->topic = ("hg/" + login + "/state").c_str(); o->retained = true;
+    Out* o = new Out; o->topic = (tb + login + "/state").c_str(); o->retained = true;
     serializeJson(s, o->payload); post(o); c.lastSmall = now;
   }
   if (!was) { Serial.printf("[poll] %s online\n", login.c_str()); hubEvent(c.name + " is online"); }
@@ -564,7 +582,7 @@ static void publishStats() {
     e["ago"] = (now - hubEvents[i].at) / 1000; e["text"] = hubEvents[i].text;
   }
   xSemaphoreGive(ctrlMx);
-  Out* o = new Out; o->topic = ("hg/" + cloudId + "/full").c_str(); o->retained = true;
+  Out* o = new Out; o->topic = (tb + hubKey + "/full").c_str(); o->retained = true;
   serializeJson(d, o->payload);
   post(o);
 }
@@ -632,7 +650,7 @@ static void onTunnel(const String& login, uint8_t* payload, unsigned int len) {
     Job* j = new Job; j->tunnel = true; j->req = *r; j->req.queued = millis();
     for (size_t i = 0; i < tunIn.size(); i++) if (tunIn[i].id == id) { tunIn.erase(tunIn.begin() + i); break; }
     if (xQueueSend(jobQ, &j, 0) != pdTRUE) {           // all workers busy and the queue full
-      Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + j->req.reply).c_str(); o->id = j->req.id; o->status = 503;
+      Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + j->req.reply).c_str(); o->id = j->req.id; o->status = 503;
       delete j; post(o);
     }
   }
@@ -651,7 +669,7 @@ static void postBatchReply(std::shared_ptr<Batch> b) {
     xSemaphoreGive(b->done);
     return;
   }
-  Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + b->reply).c_str(); o->id = b->id; o->status = 200;
+  Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + b->reply).c_str(); o->id = b->id; o->status = 200;
   o->ct = "application/json";
   o->payload = b->results;
   if (o->payload.size() > 1 && o->payload.back() == ',') o->payload.pop_back();
@@ -686,7 +704,7 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
     unlockUntil = millis() + 10UL * 60 * 1000; if (!unlockUntil) unlockUntil = 1;
     hubEvent("Updates allowed for 10 minutes");
     statsDirty = true;
-    Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + String((const char*)(h["c"] | ""))).c_str();
+    Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + String((const char*)(h["c"] | ""))).c_str();
     o->id = (const char*)(h["id"] | ""); o->status = 200; o->ct = "application/json"; o->payload = "{\"unlocked\":600}";
     post(o);
     return nullptr;
@@ -710,7 +728,7 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
     if (f) { saved = serializeJson(keep, f) > 0; f.close(); }
     hubEvent(String("This hub now looks after ") + String((int)ownedMacs.size()) + (ownedMacs.size() == 1 ? " controller" : " controllers"));
     statsDirty = true;
-    Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + String((const char*)(h["c"] | ""))).c_str();
+    Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + String((const char*)(h["c"] | ""))).c_str();
     o->id = (const char*)(h["id"] | ""); o->status = saved ? 200 : 500; o->ct = "application/json";
     o->payload = "{\"owned\":" + std::to_string(ownedMacs.size()) + ",\"here\":" + std::to_string(mine) + "}";
     post(o);
@@ -786,9 +804,9 @@ static void queueHubCommand(const uint8_t* payload, size_t len) {
 
 static void onMessage(char* topic, uint8_t* payload, unsigned int len) {
   String t(topic);
-  if (t.startsWith("hg/req/")) { onTunnel(t.substring(7), payload, len); return; }
-  if (cloudId.length() && t == "hg/" + cloudId + "/cmd") { queueHubCommand(payload, len); return; }
-  if (t == "hg/applog/cmd") {                // the app's diagnostics timeline, for /log
+  if (t.startsWith(tb + "req/")) { onTunnel(t.substring(tb.length() + 4), payload, len); return; }
+  if (hubKey.length() && t == tb + hubKey + "/cmd") { queueHubCommand(payload, len); return; }
+  if (t == tb + "applog/cmd") {                // the app's diagnostics timeline, for /log
     String all((const char*)payload, len);
     int from = 0;
     while (from < (int)all.length()) {
@@ -881,7 +899,7 @@ static bool tunAllowed(TunReq& r) {
 static void runTunnel(TunReq& r) {
   uint32_t t0 = millis();
   uint32_t wait = t0 - r.queued;
-  Out* o = new Out; o->tunnel = true; o->topic = ("hg/resp/" + r.reply).c_str(); o->id = r.id;
+  Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + r.reply).c_str(); o->id = r.id;
   String ip;
   int idx = findCtrl(r.login, ip);
   if (r.bad || idx < 0 || ip.isEmpty()) {
@@ -1008,8 +1026,13 @@ static void connectCloud() {
   uint32_t t0 = millis();
   if (mqtt.connect(cloudId.c_str(), stateTopicSelf.c_str(), 1, true, "{\"online\":false}")) {
     connects++; lastMqttErr = 0;
-    mqtt.subscribe("hg/+/cmd", 1);
-    mqtt.subscribe("hg/req/+", 0);
+    if (cloudHome.length()) {
+      mqtt.subscribe((tb + "hub/cmd").c_str(), 1);
+      mqtt.subscribe((tb + "applog/cmd").c_str(), 0);
+    } else {
+      mqtt.subscribe("hg/+/cmd", 1);
+    }
+    mqtt.subscribe((tb + "req/+").c_str(), 0);
     JsonDocument me; me["online"] = true; me["ver"] = BRIDGE_VERSION; me["ip"] = WiFi.localIP().toString(); me["reset"] = resetReason;
     String s; serializeJson(me, s);
     mqtt.publish(stateTopicSelf.c_str(), s.c_str(), true);
@@ -1093,7 +1116,7 @@ static void webHubPlay() {
 
 static void webStatusJson() {
   JsonDocument d;
-  d["ver"] = BRIDGE_VERSION; d["id"] = cloudId; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected(); d["err"] = lastMqttErr;
+  d["ver"] = BRIDGE_VERSION; d["id"] = cloudId; d["home"] = cloudHome.length() > 0; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected(); d["err"] = lastMqttErr;
   d["reset"] = resetReason; d["crashStage"] = lastCrashStage;
   d["connects"] = (uint32_t)connects; d["in"] = (uint32_t)cmdsIn; d["sent"] = (uint32_t)cmdsSent; d["refused"] = (uint32_t)cmdsRefused;
   d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
@@ -1132,6 +1155,8 @@ static bool loadCloud() {
   f.close();
   if (!ok) return false;
   cloudId = d["id"] | ""; cloudEndpoint = d["endpoint"] | "";
+  cloudHome = d["home"] | "";
+  if (cloudHome.length()) { tb = "hg/" + cloudHome + "/"; hubKey = "hub"; } else { tb = "hg/"; hubKey = cloudId; }
   cloudCa = d["ca"] | ""; cloudCert = d["cert"] | ""; cloudKey = d["key"] | "";
   return cloudId.length() && cloudEndpoint.length() && cloudCa.indexOf("BEGIN") >= 0 &&
          cloudCert.indexOf("BEGIN") >= 0 && cloudKey.indexOf("PRIVATE KEY") >= 0;
@@ -1151,6 +1176,45 @@ static void webProvision() {
   web.send(200, "text/plain", "saved, restarting");
   delay(500);
   ESP.restart();
+}
+
+// The phone's own cloud login for this home (APP_FILE, put on the hub when it was built), handed
+// over on the home network to whoever has the setup code from the hub's label:
+//   POST /creds {"n": <base64, 16 random bytes from the app>}
+//   -> {"n": <base64, 16 random bytes from the hub>, "c": <base64 of GCM nonce(12) + ciphertext + tag(16)>}
+// key = PBKDF2-HMAC-SHA256(setup code, salt = app's bytes + hub's bytes, 60000 rounds, 32 bytes).
+// The slow key makes guessing the 8-character code from a captured answer impractical.
+#define APP_FILE "/app.json"
+static String b64(const uint8_t* p, size_t n);
+static void webCreds() {
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  JsonDocument q;
+  if (deserializeJson(q, web.arg("plain"))) { web.send(400, "text/plain", "bad"); return; }
+  const char* n64 = q["n"] | "";
+  uint8_t salt[32]; size_t n = 0;
+  if (mbedtls_base64_decode(salt, 16, &n, (const unsigned char*)n64, strlen(n64)) || n != 16) { web.send(400, "text/plain", "bad"); return; }
+  File f = LittleFS.open(APP_FILE, "r");
+  if (!f) { web.send(404, "text/plain", "this hub has no phone login"); return; }
+  String plain = f.readString(); f.close();
+  esp_fill_random(salt + 16, 16);
+  uint8_t key[32], iv[12], tag[16];
+  esp_fill_random(iv, sizeof iv);
+  mbedtls_md_context_t md; mbedtls_md_init(&md);
+  int r = mbedtls_md_setup(&md, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  if (!r) r = mbedtls_pkcs5_pbkdf2_hmac(&md, (const unsigned char*)setupCode.c_str(), setupCode.length(), salt, 32, 60000, 32, key);
+  mbedtls_md_free(&md);
+  std::vector<unsigned char> out(12 + plain.length() + 16);
+  memcpy(out.data(), iv, 12);
+  mbedtls_gcm_context g; mbedtls_gcm_init(&g);
+  if (!r) r = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
+  if (!r) r = mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, plain.length(), iv, 12, nullptr, 0,
+                                        (const unsigned char*)plain.c_str(), out.data() + 12, 16, tag);
+  mbedtls_gcm_free(&g);
+  memset(key, 0, sizeof key);
+  if (r) { web.send(500, "text/plain", "failed"); return; }
+  memcpy(out.data() + 12 + plain.length(), tag, 16);
+  hubEvent("A phone asked for this home's login");
+  web.send(200, "application/json", "{\"n\":\"" + b64(salt + 16, 16) + "\",\"c\":\"" + b64(out.data(), out.size()) + "\"}");
 }
 
 static void webCors() {
@@ -1314,7 +1378,7 @@ static bool openSealed(const char* c64, JsonDocument& out) {
 
 static String bleInfo() {
   JsonDocument d;
-  d["op"] = "info"; d["name"] = hubName(); d["mac"] = WiFi.macAddress(); d["id"] = cloudId;
+  d["op"] = "info"; d["name"] = hubName(); d["mac"] = WiFi.macAddress(); d["id"] = cloudId; d["home"] = cloudHome.length() > 0;
   d["ver"] = BRIDGE_VERSION; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected();
   d["nonce"] = b64(bleNonce, sizeof bleNonce);
   JsonObject w = d["wifi"].to<JsonObject>();
@@ -1424,7 +1488,7 @@ void setup() {
   provisioned = loadCloud();
   loadOwned();
   loadKnown();
-  stateTopicSelf = String("hg/") + (cloudId.length() ? cloudId : String("bridge")) + "/state";
+  stateTopicSelf = tb + (hubKey.length() ? hubKey : String("bridge")) + "/state";
   ctrlMx = xSemaphoreCreateMutex();
   jobQ = xQueueCreate(32, sizeof(Job*));
   outQ = xQueueCreate(48, sizeof(Out*));
@@ -1457,6 +1521,8 @@ void setup() {
   web.on("/json", webStatusJson);
   web.on("/log", webLog);
   web.on("/hub/play", HTTP_POST, webHubPlay);
+  web.on("/creds", HTTP_POST, webCreds);
+  web.on("/creds", HTTP_OPTIONS, webCors);
   web.on("/update", HTTP_POST, webUpdateDone, webUpdateChunk);
   web.on("/provision", HTTP_POST, webProvision);
   web.on("/provision", HTTP_OPTIONS, webCors);
