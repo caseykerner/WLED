@@ -53,7 +53,7 @@ static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.9.2"
+#define BRIDGE_VERSION    "0.9.3"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -268,6 +268,41 @@ static void loadOwned() {
   f.close();
 }
 
+// The controllers this hub has met (hardware address, last address, name) are kept in KNOWN_FILE,
+// so after a restart it goes straight back to them. Before 0.9.3 it had to find each one again by
+// asking the network, which took minutes and missed any that were powered off at the time.
+#define KNOWN_FILE "/known.json"
+static volatile bool knownDirty = false;
+static void loadKnown() {
+  File f = LittleFS.open(KNOWN_FILE, "r");
+  if (!f) return;
+  JsonDocument d;
+  if (!deserializeJson(d, f)) {
+    for (JsonObject k : d.as<JsonArray>()) {
+      String mac = k["mac"] | "", ip = k["ip"] | "";
+      if (mac.isEmpty() || ip.isEmpty() || nCtrls >= MAX_CTRLS) continue;
+      Controller& c = ctrls[nCtrls];
+      c.mac = mac; c.ip = ip; c.name = k["name"] | "WLED"; c.login = loginFor(c.name);
+      c.owned = isOwnedMac(mac);
+      c.lock = xSemaphoreCreateMutex();
+      // Taken as online until a check says otherwise, so one that's off gets reported as such.
+      c.online = true; c.misses = 1; c.pollSoon = true;
+      nCtrls = nCtrls + 1;
+    }
+  }
+  f.close();
+}
+static void saveKnown() {                               // status task only
+  JsonDocument d; JsonArray a = d.to<JsonArray>();
+  xSemaphoreTake(ctrlMx, portMAX_DELAY);
+  for (int i = 0; i < nCtrls; i++) {
+    JsonObject k = a.add<JsonObject>(); k["mac"] = ctrls[i].mac; k["ip"] = ctrls[i].ip; k["name"] = ctrls[i].name;
+  }
+  xSemaphoreGive(ctrlMx);
+  File f = LittleFS.open(KNOWN_FILE, "w");
+  if (f) { serializeJson(d, f); f.close(); }
+}
+
 static int findCtrl(const String& login, String& ip) {
   int found = -1;
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
@@ -371,6 +406,7 @@ static void scan() {
       nCtrls = nCtrls + 1;
     }
     if (idx >= 0) {
+      if (ctrls[idx].ip != ip || ctrls[idx].name != name) knownDirty = true;
       ctrls[idx].ip = ip; ctrls[idx].name = name; ctrls[idx].login = loginFor(name); ctrls[idx].direct = direct;
       ctrls[idx].owned = isOwnedMac(mac);
     }
@@ -536,7 +572,11 @@ static void publishStats() {
 static void statusTask(void*) {
   for (;;) {
     if (WiFi.status() == WL_CONNECTED) {
-      if (millis() - lastScan > SCAN_EVERY_MS || nCtrls == 0) scan();
+      // Looking for controllers: every minute for the first ten after a start (not all answer each
+      // time), every five after that, and straight away while none is known.
+      uint32_t scanEvery = millis() < 600000UL ? 60000UL : SCAN_EVERY_MS;
+      if (millis() - lastScan > scanEvery || nCtrls == 0) scan();
+      if (knownDirty) { knownDirty = false; saveKnown(); }
       // Asked-for checks (after a change) first, then whatever is due.
       int pick = -1;
       for (int i = 0; i < nCtrls && pick < 0; i++) if (ctrls[i].owned && ctrls[i].pollSoon) pick = i;
@@ -1383,6 +1423,7 @@ void setup() {
   LittleFS.begin(true);
   provisioned = loadCloud();
   loadOwned();
+  loadKnown();
   stateTopicSelf = String("hg/") + (cloudId.length() ? cloudId : String("bridge")) + "/state";
   ctrlMx = xSemaphoreCreateMutex();
   jobQ = xQueueCreate(32, sizeof(Job*));
