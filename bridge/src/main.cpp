@@ -46,7 +46,7 @@
 static String cloudId, cloudEndpoint, cloudCa, cloudCert, cloudKey;
 static bool provisioned = false;
 
-#define BRIDGE_VERSION    "0.4.1"
+#define BRIDGE_VERSION    "0.4.2"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -561,10 +561,26 @@ static void onHubCommand(uint8_t* payload, unsigned int len) {
   STAGE(109);
 }
 
+// Hub commands are unpacked in their own task: inflating a batch needs far more stack than the
+// main loop's 8 KB (0.4.0 crashed in the decompressor on a real 4-controller look).
+static QueueHandle_t hubQ;
+static void hubTask(void*) {
+  for (;;) {
+    std::string* m = nullptr;
+    if (xQueueReceive(hubQ, &m, portMAX_DELAY) != pdTRUE || !m) continue;
+    onHubCommand((uint8_t*)m->data(), m->size());
+    delete m;
+  }
+}
+static void queueHubCommand(const uint8_t* payload, size_t len) {
+  std::string* m = new std::string((const char*)payload, len);
+  if (xQueueSend(hubQ, &m, 0) != pdTRUE) { delete m; cmdsRefused++; }
+}
+
 static void onMessage(char* topic, uint8_t* payload, unsigned int len) {
   String t(topic);
   if (t.startsWith("hg/req/")) { onTunnel(t.substring(7), payload, len); return; }
-  if (cloudId.length() && t == "hg/" + cloudId + "/cmd") { onHubCommand(payload, len); return; }
+  if (cloudId.length() && t == "hg/" + cloudId + "/cmd") { queueHubCommand(payload, len); return; }
   if (t == "hg/applog/cmd") {                // the app's diagnostics timeline, for /log
     String all((const char*)payload, len);
     int from = 0;
@@ -842,7 +858,7 @@ static void webLog() {
 // Local test of a hub command (same body as hg/<hub>/cmd), from the home network only.
 static void webPlay() {
   String body = web.arg("plain");
-  onHubCommand((uint8_t*)body.c_str(), body.length());
+  queueHubCommand((const uint8_t*)body.c_str(), body.length());
   web.sendHeader("Access-Control-Allow-Origin", "*");
   web.send(200, "text/plain", "queued");
 }
@@ -940,6 +956,7 @@ void setup() {
   ctrlMx = xSemaphoreCreateMutex();
   jobQ = xQueueCreate(32, sizeof(Job*));
   outQ = xQueueCreate(48, sizeof(Out*));
+  hubQ = xQueueCreate(8, sizeof(std::string*));
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("homeglow-bridge");
@@ -975,6 +992,7 @@ void setup() {
   // Workers and the status task run on core 0; the main loop (cloud, web page) stays on core 1.
   for (int i = 0; i < WORKERS; i++) xTaskCreatePinnedToCore(workerTask, "hgWork", 10240, nullptr, 1, nullptr, i % 2);
   xTaskCreatePinnedToCore(statusTask, "hgStatus", 10240, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(hubTask, "hgHub", 24576, nullptr, 1, nullptr, 0);
 
   if (provisioned) connectCloud(); else led(40, 0, 40);   // purple: needs its cloud login
 }
