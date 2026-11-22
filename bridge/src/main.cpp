@@ -25,6 +25,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
@@ -65,7 +66,7 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.11.0"
+#define BRIDGE_VERSION    "0.12.0"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -103,6 +104,9 @@ struct Controller {
   uint8_t desiredTries = 0;
   bool desiredOk = false;
   std::string info;                // last /json/info, raw
+  // After a restart ordered by support: put the lights back as they were ({"on","bri","ps"}).
+  std::string restore;
+  uint32_t restoreFrom = 0;        // millis() when the restart was ordered
   SemaphoreHandle_t lock = nullptr;
 };
 static Controller ctrls[MAX_CTRLS];
@@ -586,6 +590,147 @@ static void poll(int i) {
   if (!was) { Serial.printf("[poll] %s online\n", login.c_str()); hubEvent(c.name + " is online"); }
 }
 
+
+// ---------- Govee lights (0.12) ----------
+// Govee Wi-Fi lights with "LAN Control" switched on (in the Govee Home app, per light) answer on the
+// home network without Govee's cloud: UDP, JSON. Per Govee's "WLAN Guide" (LAN API):
+//   find:    {"msg":{"cmd":"scan","data":{"account_topic":"reserve"}}} to 239.255.255.250:4001;
+//            each light answers to port 4002 with its ip, device id and model (sku)
+//   control: to <light>:4003  turn {"value":0|1} · brightness {"value":1-100} ·
+//            colorwc {"color":{"r","g","b"},"colorTemInKelvin":0}
+//   status:  devStatus {} to <light>:4003, answered to port 4002 (onOff, brightness, color)
+// Only whole-light on/off, brightness and color: Govee's scenes and per-segment colors aren't in
+// this API. The hub lists the lights it finds in its status ("govee") and takes orders for them.
+struct Govee {
+  String id, sku, ip;
+  bool on = false;
+  uint8_t bri = 0, r = 0, g = 0, b = 0;
+  uint32_t seen = 0, asked = 0;      // millis()
+};
+#define MAX_GOVEE 16
+static Govee govees[MAX_GOVEE];
+static int nGovee = 0;
+static SemaphoreHandle_t goveeMx;    // guards the list and the sending socket
+static WiFiUDP goveeIn, goveeOut;
+static bool goveeListening = false;
+static uint32_t goveeScanAt = 0;
+static volatile uint32_t goveeAskAt = 0;   // millis(): ask every light for its status then (after an order)
+
+// One message to a light (or the search address). Caller holds goveeMx.
+static void goveeSend(const IPAddress& to, uint16_t port, const char* cmd, const char* data) {
+  String m = String("{\"msg\":{\"cmd\":\"") + cmd + "\",\"data\":" + data + "}}";
+  if (!goveeOut.beginPacket(to, port)) return;
+  goveeOut.write((const uint8_t*)m.c_str(), m.length());
+  goveeOut.endPacket();
+}
+
+// Called from the status task on every pass: reads what lights have sent, and searches / asks for
+// status when due. Nothing here waits.
+static void goveePoll() {
+  if (!goveeListening) { goveeListening = goveeIn.begin(4002) == 1; if (!goveeListening) return; }
+  uint32_t now = millis();
+  for (int guard = 0; guard < 16; guard++) {
+    int n = goveeIn.parsePacket();
+    if (n <= 0) break;
+    char buf[640];
+    int got = goveeIn.read((uint8_t*)buf, sizeof buf - 1);
+    IPAddress from = goveeIn.remoteIP();
+    if (got <= 0) continue;
+    buf[got] = 0;
+    JsonDocument d;
+    if (deserializeJson(d, buf)) continue;
+    const char* cmd = d["msg"]["cmd"] | "";
+    JsonObjectConst data = d["msg"]["data"];
+    xSemaphoreTake(goveeMx, portMAX_DELAY);
+    if (!strcmp(cmd, "scan")) {
+      String id = data["device"] | "";
+      String ip = data["ip"] | from.toString().c_str();
+      int at = -1;
+      for (int i = 0; i < nGovee; i++) if (govees[i].id == id) at = i;
+      if (at < 0 && id.length() && nGovee < MAX_GOVEE) {
+        at = nGovee++; govees[at] = Govee(); govees[at].id = id;
+        statsDirty = true;
+      }
+      if (at >= 0) {
+        if (govees[at].ip != ip) statsDirty = true;
+        govees[at].ip = ip; govees[at].sku = (const char*)(data["sku"] | ""); govees[at].seen = now ? now : 1;
+        if (!govees[at].asked) goveeAskAt = now + 100;
+      }
+    } else if (!strcmp(cmd, "devStatus")) {
+      String ip = from.toString();
+      for (int i = 0; i < nGovee; i++) {
+        Govee& g = govees[i];
+        if (g.ip != ip) continue;
+        bool on = (data["onOff"] | 0) != 0;
+        uint8_t bri = data["brightness"] | 0, r = data["color"]["r"] | 0, gr = data["color"]["g"] | 0, b = data["color"]["b"] | 0;
+        if (on != g.on || bri != g.bri || r != g.r || gr != g.g || b != g.b || !g.seen) statsDirty = true;
+        g.on = on; g.bri = bri; g.r = r; g.g = gr; g.b = b; g.seen = now ? now : 1;
+      }
+    }
+    xSemaphoreGive(goveeMx);
+  }
+  // Search: every 10 s in the first minute after a start, every minute after that.
+  if (!goveeScanAt || now - goveeScanAt > (now < 60000UL ? 10000UL : 60000UL)) {
+    goveeScanAt = now ? now : 1;
+    xSemaphoreTake(goveeMx, portMAX_DELAY);
+    goveeSend(IPAddress(239, 255, 255, 250), 4001, "scan", "{\"account_topic\":\"reserve\"}");
+    xSemaphoreGive(goveeMx);
+  }
+  // Status: every 15 s for each light, and shortly after an order.
+  bool askAll = goveeAskAt && (int32_t)(now - goveeAskAt) >= 0;
+  if (askAll) goveeAskAt = 0;
+  xSemaphoreTake(goveeMx, portMAX_DELAY);
+  for (int i = 0; i < nGovee; i++) {
+    Govee& g = govees[i];
+    if (!askAll && g.asked && now - g.asked < 15000UL) continue;
+    IPAddress ip;
+    if (!ip.fromString(g.ip)) continue;
+    g.asked = now ? now : 1;
+    goveeSend(ip, 4003, "devStatus", "{}");
+  }
+  xSemaphoreGive(goveeMx);
+}
+
+// An order for one light: {"id":<device id>,"on":bool,"bri":1-100,"col":[r,g,b]} (any of the three).
+static bool goveeOrder(JsonObjectConst o) {
+  String id = o["id"] | "";
+  bool sent = false;
+  xSemaphoreTake(goveeMx, portMAX_DELAY);
+  for (int i = 0; i < nGovee; i++) {
+    Govee& g = govees[i];
+    IPAddress ip;
+    if (g.id != id || !ip.fromString(g.ip)) continue;
+    if (o["on"].is<bool>()) goveeSend(ip, 4003, "turn", o["on"].as<bool>() ? "{\"value\":1}" : "{\"value\":0}");
+    if (o["bri"].is<int>()) {
+      int v = constrain((int)o["bri"], 1, 100);
+      goveeSend(ip, 4003, "brightness", (String("{\"value\":") + v + "}").c_str());
+    }
+    JsonArrayConst c = o["col"];
+    if (c.size() == 3) {
+      String d = String("{\"color\":{\"r\":") + constrain((int)c[0], 0, 255) + ",\"g\":" + constrain((int)c[1], 0, 255) + ",\"b\":" + constrain((int)c[2], 0, 255) + "},\"colorTemInKelvin\":0}";
+      goveeSend(ip, 4003, "colorwc", d.c_str());
+    }
+    sent = true;
+  }
+  xSemaphoreGive(goveeMx);
+  if (sent) { uint32_t t = millis() + 500; goveeAskAt = t ? t : 1; }
+  return sent;
+}
+
+// The lights for the hub's status: [{"id","sku","ip","online","on","bri","col":[r,g,b]}].
+static void goveeList(JsonArray out) {
+  uint32_t now = millis();
+  xSemaphoreTake(goveeMx, portMAX_DELAY);
+  for (int i = 0; i < nGovee; i++) {
+    Govee& g = govees[i];
+    JsonObject o = out.add<JsonObject>();
+    o["id"] = g.id; o["sku"] = g.sku; o["ip"] = g.ip; o["online"] = g.seen && now - g.seen < 75000UL;
+    o["on"] = g.on; o["bri"] = g.bri;
+    JsonArray c = o["col"].to<JsonArray>(); c.add(g.r); c.add(g.g); c.add(g.b);
+  }
+  xSemaphoreGive(goveeMx);
+}
+
 // Support access on (for `seconds`) or off (0). On: a new token, and everything is published again so
 // the copies under sup/ exist at once. Off: the copies are erased (empty retained messages).
 static void setSupport(uint32_t seconds) {
@@ -641,6 +786,7 @@ static void publishStats() {
   JsonArray found = d["found"].to<JsonArray>();      // on the network, but not this hub's
   JsonArray ev = d["events"].to<JsonArray>();
   d["listed"] = ownedListed;
+  if (nGovee) goveeList(d["govee"].to<JsonArray>());
   xSemaphoreTake(ctrlMx, portMAX_DELAY);
   for (int i = 0; i < nCtrls; i++) {
     Controller& c = ctrls[i];
@@ -670,6 +816,20 @@ static void statusTask(void*) {
       if (supportActive && !supportOn()) setSupport(0);                               // time's up
       else if (supportActive && millis() - supportSaved > 600000UL) saveSupport();    // so a restart doesn't add time
       if (updating) { delay(200); continue; }
+      goveePoll();
+      // Lights back as they were after a restart ordered by support (tried for 2 minutes).
+      for (int i = 0; i < nCtrls; i++) {
+        Controller& c = ctrls[i];
+        if (c.restore.empty()) continue;
+        uint32_t since = millis() - c.restoreFrom;
+        if (since > 120000UL) { c.restore.clear(); continue; }
+        if (since < 12000UL || since / 4000 == (since - 60) / 4000) continue;      // give it time to start; then every ~4 s
+        if (xSemaphoreTake(c.lock, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+        std::string out;
+        int code = wledRequest(c.ip, "POST", "/json/state", c.restore, "application/json", out, nullptr, 1500, 3000);
+        xSemaphoreGive(c.lock);
+        if (code == 200) { c.restore.clear(); c.pollSoon = true; hubEvent(c.name + ": lights put back as they were"); }
+      }
       // Asked-for checks (after a change) first, then whatever is due.
       int pick = -1;
       for (int i = 0; i < nCtrls && pick < 0; i++) if (ctrls[i].owned && ctrls[i].pollSoon) pick = i;
@@ -781,6 +941,14 @@ static std::shared_ptr<Batch> onHubCommand(uint8_t* payload, unsigned int len) {
     statsDirty = true;
     Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + String((const char*)(h["c"] | ""))).c_str();
     o->id = (const char*)(h["id"] | ""); o->status = 200; o->ct = "application/json"; o->payload = "{\"unlocked\":600}";
+    post(o);
+    return nullptr;
+  }
+  // A Govee light: {"govee":{"id","on","bri","col"}} through AWS (at home the app posts to /govee).
+  if (h["govee"].is<JsonObjectConst>() && !(h["local"] | false)) {
+    bool ok = goveeOrder(h["govee"].as<JsonObjectConst>());
+    Out* o = new Out; o->tunnel = true; o->topic = (tb + "resp/" + String((const char*)(h["c"] | ""))).c_str();
+    o->id = (const char*)(h["id"] | ""); o->status = ok ? 200 : 404; o->ct = "application/json"; o->payload = ok ? "{\"ok\":true}" : "{\"ok\":false}";
     post(o);
     return nullptr;
   }
@@ -997,6 +1165,15 @@ static void onSupportCommand(const uint8_t* payload, size_t len) {
     else if (xSemaphoreTake(ctrls[idx].lock, pdMS_TO_TICKS(15000)) != pdTRUE) { o->status = 503; o->payload = "{\"error\":\"controller busy\"}"; }
     else {
       std::string out;
+      if (op == "reboot") {       // what the lights are doing now, to put back once it has restarted
+        std::string st;
+        JsonDocument sd;
+        if (wledRequest(ip, "GET", "/json/state", "", "", st, nullptr, 3000, 6000) == 200 && !deserializeJson(sd, st)) {
+          JsonDocument keep; keep["on"] = sd["on"] | false; keep["bri"] = sd["bri"] | 128;
+          int ps = sd["ps"] | -1; if (ps > 0) keep["ps"] = ps;
+          ctrls[idx].restore.clear(); serializeJson(keep, ctrls[idx].restore); ctrls[idx].restoreFrom = millis();
+        }
+      }
       int code = op == "info" ? wledRequest(ip, "GET", "/json/info", "", "", out, nullptr, 3000, 6000)
                               : wledRequest(ip, "POST", "/json/state", "{\"rb\":true}", "application/json", out, nullptr, 3000, 6000);
       xSemaphoreGive(ctrls[idx].lock);
@@ -1368,6 +1545,14 @@ static void webHubPlay() {
   web.send(200, "application/json", b->results.c_str());
 }
 
+// The app at home: one order for a Govee light, {"id","on","bri","col"}.
+static void webGovee() {
+  JsonDocument d;
+  if (deserializeJson(d, web.arg("plain"))) { web.send(400, "text/plain", "bad"); return; }
+  bool ok = goveeOrder(d.as<JsonObjectConst>());
+  web.send(ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
 static void webStatusJson() {
   JsonDocument d;
   d["ver"] = BRIDGE_VERSION; d["id"] = cloudId; d["home"] = cloudHome.length() > 0; d["provisioned"] = provisioned; d["cloud"] = mqtt.connected(); d["err"] = lastMqttErr;
@@ -1376,6 +1561,7 @@ static void webStatusJson() {
   d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap(); d["psram"] = ESP.getFreePsram(); d["up"] = millis() / 1000;
   d["internal"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL); d["largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
   d["lowMem"] = lowMemory(); d["updates"] = setupAllowed(); d["listed"] = ownedListed;
+  if (nGovee) goveeList(d["govee"].to<JsonArray>());
   uint32_t n = tunDone;
   d["tunnel"] = n; d["tunnelRefused"] = (uint32_t)tunRefused; d["shortWrites"] = (uint32_t)shortWrites;
   d["avgMs"] = n ? (uint32_t)(tunMsTotal / n) : 0; d["avgWledMs"] = n ? (uint32_t)(wledMsTotal / n) : 0;
@@ -1745,6 +1931,7 @@ void setup() {
   if (cloudHome.length()) loadSupport();
   stateTopicSelf = tb + (hubKey.length() ? hubKey : String("bridge")) + "/state";
   ctrlMx = xSemaphoreCreateMutex();
+  goveeMx = xSemaphoreCreateMutex();
   jobQ = xQueueCreate(32, sizeof(Job*));
   outQ = xQueueCreate(48, sizeof(Out*));
   hubQ = xQueueCreate(8, sizeof(std::string*));
@@ -1776,6 +1963,7 @@ void setup() {
   web.on("/json", webStatusJson);
   web.on("/log", webLog);
   web.on("/hub/play", HTTP_POST, webHubPlay);
+  web.on("/govee", HTTP_POST, webGovee);
   web.on("/creds", HTTP_POST, webCreds);
   web.on("/creds", HTTP_OPTIONS, webCors);
   web.on("/update", HTTP_POST, webUpdateDone, webUpdateChunk);
