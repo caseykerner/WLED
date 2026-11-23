@@ -66,7 +66,7 @@ static String hubKey;                     // the hub's own topic part: its id, o
 static bool provisioned = false;
 static String setupCode;                  // Bluetooth setup code, from the label (written at the factory into /setup.json)
 
-#define BRIDGE_VERSION    "0.13.1"
+#define BRIDGE_VERSION    "0.13.2"
 #define TUN_PART          48000
 #define TUN_MAX_BODY      (200 * 1024)
 #define CLOUD_FILE        "/cloud.json"
@@ -76,7 +76,7 @@ static String setupCode;                  // Bluetooth setup code, from the labe
 #define WORKERS           4
 #define STATE_EVERY_MS    5000UL     // online controllers: state read this often (published only when it changes)
 #define INFO_EVERY_MS     60000UL    // info (memory, uptime, Wi-Fi...) read this often
-#define HEARTBEAT_MS      60000UL    // status republished at least this often even when nothing changed
+#define HEARTBEAT_MS      300000UL   // status republished at least this often even when nothing changed (every message is paid for)
 #define OFFLINE_EVERY_MS  30000UL    // controllers that don't answer: tried again this often
 #define SCAN_EVERY_MS     300000UL
 #define MAX_CMD           2048
@@ -538,6 +538,7 @@ static void poll(int i) {
   int code = wledRequest(ip, "GET", "/json/state", "", "", state, nullptr, cto, 3000);
   bool infoDue = code == 200 && (c.info.empty() || millis() - c.lastInfo > INFO_EVERY_MS || !c.online);
   std::string info;
+  bool hadInfo = !c.info.empty();
   if (infoDue && wledRequest(ip, "GET", "/json/info", "", "", info, nullptr, cto, 3000) == 200) {
     c.info = info; c.lastInfo = millis();
   }
@@ -564,10 +565,12 @@ static void poll(int i) {
   if (!was) c.onlineSince = millis();
   checkDesired(c, login, state, !was);
   uint32_t h = fnv(state);
-  bool changed = h != c.stateHash || !was;
+  // Reading the info again (uptime, memory...) is not news by itself: only a change in what the
+  // lights are doing, coming back online, or the first info read is sent at once. (0.13.2)
+  bool changed = h != c.stateHash || !was || (!hadInfo && !c.info.empty());
   c.stateHash = h;
   uint32_t now = millis();
-  if (changed || infoDue || now - c.lastFull > HEARTBEAT_MS) {
+  if (changed || now - c.lastFull > HEARTBEAT_MS) {
     Out* o = new Out; o->topic = (tb + login + "/full").c_str(); o->retained = true;
     o->payload.reserve(state.size() + c.info.size() + 40);
     o->payload = "{\"state\":"; o->payload += state;
@@ -575,7 +578,7 @@ static void poll(int i) {
     o->payload += ",\"via\":\"bridge\"}";
     post(o); c.lastFull = now;
   }
-  if (changed || infoDue || now - c.lastSmall > HEARTBEAT_MS) {
+  if (changed || now - c.lastSmall > HEARTBEAT_MS) {
     JsonDocument fs; fs["on"] = true; fs["bri"] = true; fs["ps"] = true; fs["pl"] = true;
     JsonDocument st; deserializeJson(st, state, DeserializationOption::Filter(fs));
     JsonDocument fi; fi["freeheap"] = true; fi["uptime"] = true; fi["ver"] = true;
@@ -970,6 +973,7 @@ static void publishStats() {
   JsonDocument d(&spiAlloc);
   uint32_t now = millis();
   d["hub"] = true; d["ver"] = BRIDGE_VERSION; d["up"] = now / 1000; d["reset"] = resetReason;
+  d["every"] = 30;                         // seconds between these reports, so the app need not assume it
   d["crashStage"] = lastCrashStage; d["heap"] = ESP.getFreeHeap(); d["minHeap"] = ESP.getMinFreeHeap();
   d["psram"] = ESP.getFreePsram(); d["rssi"] = WiFi.RSSI(); d["ip"] = WiFi.localIP().toString();
   d["internal"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL); d["largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
